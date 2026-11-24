@@ -1,0 +1,281 @@
+name: Integrar Tracking nativo MultiDevice (diagnostico)
+
+on:
+  push:
+    branches: [multidevice-test]
+    paths: [.github/workflows/multidevice-tracking.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  integrar:
+    name: Testar e instalar Tracking na branch de teste
+    if: github.ref == 'refs/heads/multidevice-test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar codigo da branch multidevice-test
+        uses: actions/checkout@v4
+        with:
+          ref: multidevice-test
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Preparar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Confirmar base MultiDevice existente
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/web/device-pairing.js
+          test -f src/web/device-player-client.js
+          grep -q 'MULTIDEVICE_PLAYER_V02' src/web/device-pairing.js
+          grep -q 'MULTIDEVICE_COOKIE_V03' src/web/device-pairing.js
+      - name: Preparar arquivos do Tracking (sem alterar configuracoes do Railway)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src/web scripts test
+          cat > src/web/device-tracking-core.js <<'MULTIDEVICE_TRACKING_src_web_device-tracking-core_js_END'
+          import crypto from 'node:crypto';
+          
+          // No device identity is available in native tracking requests.
+          export const TRACKING_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+          export const TRACKING_MAX_EVENTS_PER_ACCOUNT = 200;
+          export function digestToken(token) {
+            return crypto.createHash('sha256').update(String(token)).digest('hex');
+          }
+          export function newToken() {
+            return crypto.randomBytes(32).toString('base64url');
+          }
+          export function validToken(token) {
+            return typeof token === 'string' && /^[A-Za-z0-9_-]{43}$/.test(token);
+          }
+          export function nativeManifest(token) {
+            return {
+              id: `org.openprofiles.multidevice.tracking.${digestToken(token).slice(0,16)}`,
+              version: '0.3.0',
+              name: 'OpenProfiles - Rastreamento experimental',
+              description: 'Recebe eventos de reproducao desta conta Stremio para diagnostico. Nao identifica aparelhos nem altera os historicos dos perfis.',
+              resources: [{ name: 'player', types: ['movie', 'series'] }],
+              types: ['movie','series'],
+              catalogs: [],
+            };
+          }
+          export function parseNativeEvent(type, videoId, extras) {
+            if (!['movie','series'].includes(type) ||
+                typeof videoId !== 'string' || !/^[a-zA-Z0-9:_-]{3,150}$/.test(videoId) ||
+                typeof extras !== 'string' || extras.length > 500) return null;
+            const params = new URLSearchParams(extras);
+            if (['action','currentTime','duration'].some(name => params.getAll(name).length !== 1)) return null;
+            const action = params.get('action');
+            const current = params.get('currentTime');
+            const duration = params.get('duration');
+            if (!['start','pause','stop'].includes(action) || !/^\d{1,14}$/.test(current || '') ||
+                !/^\d{1,14}$/.test(duration || '')) return null;
+            const currentMs = Number(current);
+            const durationMs = Number(duration);
+            if (!Number.isSafeInteger(currentMs) || !Number.isSafeInteger(durationMs) ||
+                durationMs <= 0 || durationMs > 1e10 || currentMs < 0 ||
+                currentMs > durationMs + 120000) return null;
+            return { type, videoId, action, currentMs, durationMs };
+          }
+          MULTIDEVICE_TRACKING_src_web_device-tracking-core_js_END
+          cat > src/web/device-tracking.js <<'MULTIDEVICE_TRACKING_src_web_device-tracking_js_END'
+          import express from 'express';
+          import crypto from 'node:crypto';
+          import { esc } from './device-core.js';
+          import { digestToken, newToken, validToken, nativeManifest, parseNativeEvent, TRACKING_RETENTION_MS, TRACKING_MAX_EVENTS_PER_ACCOUNT } from './device-tracking-core.js';
+          
+          /**
+           * Experimental account-level native event collector.
+           * DO NOT attribute events to device/profile based on IP, user-agent, or the installed addon token.
+           * Does not modify mp_progress or the native Stremio history.
+           */
+          export function createNativeTrackingRouter({db, auth, config, originOkay, page}) {
+            db.exec(`
+              CREATE TABLE IF NOT EXISTS mp_tracking_installs (
+                id TEXT PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, revoked_at INTEGER
+              );
+              CREATE TABLE IF NOT EXISTS mp_tracking_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                install_id TEXT NOT NULL REFERENCES mp_tracking_installs(id) ON DELETE CASCADE,
+                type TEXT NOT NULL, video_id TEXT NOT NULL, action TEXT NOT NULL,
+                current_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+                received_at INTEGER NOT NULL
+              );
+              CREATE INDEX IF NOT EXISTS mp_tracking_events_account ON mp_tracking_events(account_id, received_at);
+            `);
+            const router = express.Router();
+            const activeInstall = db.prepare('SELECT * FROM mp_tracking_installs WHERE token_hash=? AND revoked_at IS NULL');
+            const listInstalls = db.prepare('SELECT id, created_at FROM mp_tracking_installs WHERE account_id=? AND revoked_at IS NULL ORDER BY created_at DESC');
+            const listEvents = db.prepare(`SELECT type, video_id AS videoId, action, current_ms AS currentMs,
+              duration_ms AS durationMs, received_at AS receivedAt FROM mp_tracking_events
+              WHERE account_id=? ORDER BY id DESC LIMIT 30`);
+            const addInstall = db.prepare('INSERT INTO mp_tracking_installs (id, account_id, token_hash, created_at) VALUES (?,?,?,?)');
+            const revoke = db.prepare('UPDATE mp_tracking_installs SET revoked_at=? WHERE id=? AND account_id=? AND revoked_at IS NULL');
+            const insertEvent = db.prepare(`INSERT INTO mp_tracking_events
+              (account_id,install_id,type,video_id,action,current_ms,duration_ms,received_at)
+              VALUES (?,?,?,?,?,?,?,?)`);
+            const expireEvents = db.prepare('DELETE FROM mp_tracking_events WHERE received_at<?');
+            const pruneAccount = db.prepare(`DELETE FROM mp_tracking_events WHERE account_id=? AND id NOT IN
+              (SELECT id FROM mp_tracking_events WHERE account_id=? ORDER BY id DESC LIMIT ?)`);
+            const getInstall = token => validToken(token) ? activeInstall.get(digestToken(token)) : null;
+            const cors = (req,res,next) => {
+              res.set('Access-Control-Allow-Origin','*');
+              res.set('Access-Control-Allow-Methods','GET, OPTIONS');
+              res.set('Cache-Control','no-store');
+              if (req.method === 'OPTIONS') return res.status(204).end();
+              next();
+            };
+            router.use('/addon', cors);
+            const clean = () => expireEvents.run(Date.now()-TRACKING_RETENTION_MS);
+            const csrf = req => `<input type="hidden" name="_csrf" value="${esc(req.session.csrf)}">`;
+            const dashboard = (req,res,extra='') => {
+              clean();
+              const accountId = req.session.accountId;
+              const installs = listInstalls.all(accountId);
+              const events = listEvents.all(accountId);
+              page(res,'Tracking nativo — diagnóstico',`
+                <p><strong>Experimento:</strong> recebe ações do player nativo de TODOS os aparelhos da mesma conta Stremio. Sem identificação confiável do aparelho, nenhum evento é enviado ao histórico de um perfil.</p>
+                <p>Não registramos IP, User-Agent ou endereço MAC. Os eventos ficam armazenados por até 7 dias e no máximo ${TRACKING_MAX_EVENTS_PER_ACCOUNT} por conta.</p>
+                ${extra}
+                <h2>Autorizar um coletor de testes</h2>
+                <form method="post" action="/devices/tracking/new">${csrf(req)}
+                  <label><input type="checkbox" name="consent" value="yes" required> Autorizo o recebimento dos eventos de reprodução da minha conta de teste e entendo que eles poderão incluir os outros aparelhos conectados à mesma conta.</label>
+                  <button>Gerar instalação privada</button>
+                </form>
+                <h2>Instalações ativas</h2>${installs.length ? `<ul>${installs.map(d=>`<li>${esc(d.id.slice(0,8))} — criada em ${new Date(d.created_at).toISOString().slice(0,10)}
+                    <form method="post" action="/devices/tracking/revoke">${csrf(req)}<input type="hidden" name="id" value="${esc(d.id)}"><button>Revogar coletor</button></form></li>`).join('')}</ul>`:'<p>Nenhuma instalação.</p>'}
+                <h2>Eventos recebidos — sem aparelho atribuído</h2>
+                ${events.length ? `<ol>${events.map(e=>`<li>${esc(e.type)} · ${esc(e.videoId)} · ${esc(e.action)} · ${Math.round(e.currentMs/1000)}s / ${Math.round(e.durationMs/1000)}s · ${new Date(e.receivedAt).toISOString()}</li>`).join('')}</ol>`:'<p>Nenhum evento recebido ainda.</p>'}
+                <p><a href="/devices">Voltar aos aparelhos</a></p>`);
+            };
+            router.get('/',auth.require,(req,res)=>dashboard(req,res));
+            router.post('/new',auth.require,auth.csrf,originOkay,(req,res)=> {
+              if (req.body?.consent !== 'yes') return res.status(400).send('Consentimento obrigatório.');
+              const token = newToken();
+              const id = crypto.randomUUID();
+              addInstall.run(id,req.session.accountId,digestToken(token),Date.now());
+              const manifestUrl = `${config.publicUrl.replace(/\/$/,'')}/devices/tracking/addon/${token}/manifest.json`;
+              // The unguessable installation URL is displayed once and stored only hashed.
+              dashboard(req,res,`<h2>Instalação gerada — copie agora</h2><p>Use somente na conta Stremio de teste. Link privado; quem o conhecer pode enviar eventos falsos. Não compartilhe em capturas.</p><p><code style="overflow-wrap:anywhere">${esc(manifestUrl)}</code></p><p>O Stremio pedirá consentimento explícito para compartilhar atividades. Se não houver aviso, não prossiga.</p>`);
+            });
+            router.post('/revoke',auth.require,auth.csrf,originOkay,(req,res)=> {
+              const id = String(req.body?.id || '');
+              revoke.run(Date.now(),id,req.session.accountId);
+              res.redirect(303,'/devices/tracking');
+            });
+            router.get('/addon/:token/manifest.json',(req,res)=> {
+              if (!getInstall(req.params.token)) return res.status(404).json({error:'Instalação indisponível'});
+              res.json(nativeManifest(req.params.token));
+            });
+            router.get('/addon/:token/player/:type/:videoId/:extra.json',(req,res)=> {
+              const installation = getInstall(req.params.token);
+              if (!installation) return res.status(404).json({success:false});
+              const event = parseNativeEvent(req.params.type,req.params.videoId,req.params.extra);
+              if (!event) return res.status(400).json({success:false});
+              const now = Date.now();
+              insertEvent.run(installation.account_id,installation.id,event.type,event.videoId,event.action,event.currentMs,event.durationMs,now);
+              expireEvents.run(now-TRACKING_RETENTION_MS);
+              pruneAccount.run(installation.account_id,installation.account_id,TRACKING_MAX_EVENTS_PER_ACCOUNT);
+              res.json({success:true});
+            });
+            return router;
+          }
+          MULTIDEVICE_TRACKING_src_web_device-tracking_js_END
+          cat > scripts/apply-tracking.mjs <<'MULTIDEVICE_TRACKING_scripts_apply-tracking_mjs_END'
+          #!/usr/bin/env node
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const check = process.argv.includes('--check');
+          const root = process.cwd();
+          const file = path.join(root,'src/web/device-pairing.js');
+          for (const f of ['src/web/device-tracking.js','src/web/device-tracking-core.js']) {
+            if (!fs.existsSync(path.join(root,f))) throw Error(`Arquivo ausente: ${f}`);
+          }
+          let source = fs.readFileSync(file,'utf8');
+          if (source.includes('MULTIDEVICE_TRACKING_V03')) {
+            console.log('Integração Tracking já aplicada.');process.exit(0);
+          }
+          const anchors = [
+            ["import crypto from 'node:crypto';", "import crypto from 'node:crypto';\nimport { createNativeTrackingRouter } from './device-tracking.js';"],
+            ["  router.get('/',auth.require", "  // MULTIDEVICE_TRACKING_V03: eventos nativos SEM atribuição a aparelho/perfil.\n  router.use('/tracking', createNativeTrackingRouter({ db, auth, config, originOkay, page }));\n  router.get('/',auth.require"],
+            ["      <h2>Aparelhos ativos</h2>", "      <p><a href=\"/devices/tracking\">Rastreamento nativo experimental (sem perfil atribuído)</a></p>\n      <h2>Aparelhos ativos</h2>"],
+          ];
+          for (const [oldText,newText] of anchors) {
+            const count = source.split(oldText).length-1;
+            if (count !== 1) throw Error(`Arquivo mudou; âncora ambígua/ausente: ${oldText.slice(0,70)} (${count}). Nenhuma alteração escrita.`);
+            source = source.replace(oldText,newText);
+          }
+          if (check) console.log('Patch compatível. Nenhuma modificação feita.');
+          else {fs.writeFileSync(file,source);console.log('Tracking nativo montado em /devices/tracking; dados de perfil preservados.');}
+          MULTIDEVICE_TRACKING_scripts_apply-tracking_mjs_END
+          cat > test/device-tracking.test.mjs <<'MULTIDEVICE_TRACKING_test_device-tracking_test_mjs_END'
+          import test from 'node:test';
+          import assert from 'node:assert/strict';
+          import {nativeManifest,newToken,validToken,parseNativeEvent,digestToken} from '../src/web/device-tracking-core.js';
+          test('token has enough entropy and hashed storage',()=> {
+            const a=newToken(),b=newToken();assert.ok(validToken(a));assert.notEqual(a,b);assert.notEqual(a,digestToken(a));
+            assert.equal(validToken('12345678'),false);
+          });
+          test('manifest exposes only player resource, no catalogs or device identity',()=> {
+            const manifest=nativeManifest(newToken());assert.equal(manifest.resources[0].name,'player');
+            assert.deepEqual(manifest.catalogs,[]);assert.deepEqual(manifest.types,['movie','series']);
+          });
+          test('parses official player start/pause/stop events in milliseconds',()=> {
+            const params='action=pause&currentTime=3000&duration=60000';
+            assert.deepEqual(parseNativeEvent('movie','tt1254207',params), {type:'movie',videoId:'tt1254207',action:'pause',currentMs:3000,durationMs:60000});
+            assert.equal(parseNativeEvent('series','tt0898266:9:17','action=stop&currentTime=3000&duration=60000')?.videoId,'tt0898266:9:17');
+          });
+          test('rejects malformed and duplicate events and unexpected types',()=> {
+            for(const extra of ['action=jump&currentTime=1&duration=100','action=pause&currentTime=-1&duration=100','action=pause&currentTime=100&duration=0','action=pause&currentTime=999999&duration=100','action=start&action=stop&currentTime=1&duration=100','action=start&currentTime=abc&duration=100']) {
+              assert.equal(parseNativeEvent('movie','tt1254207',extra),null,extra);
+            }
+            assert.equal(parseNativeEvent('movie','../secret','action=start&currentTime=1&duration=100'),null);
+            assert.equal(parseNativeEvent('other','tt1254207','action=start&currentTime=1&duration=100'),null);
+          });
+          MULTIDEVICE_TRACKING_test_device-tracking_test_mjs_END
+      - name: Verificar compatibilidade sem alterar arquivo antigo
+        run: node scripts/apply-tracking.mjs --check
+      - name: Aplicar Tracking experimental somente no codigo da branch
+        run: node scripts/apply-tracking.mjs
+      - name: Verificar sintaxe e eventos oficiais
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check src/web/device-tracking.js
+          node --check src/web/device-tracking-core.js
+          node --check src/web/device-pairing.js
+          node --check scripts/apply-tracking.mjs
+          node --test test/device-tracking.test.mjs
+          git diff --check
+      - name: Testar OpenProfiles original
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm test
+      - name: Restringir arquivos alterados e salvar na branch experimental
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- src/web/device-pairing.js src/web/device-tracking.js src/web/device-tracking-core.js scripts/apply-tracking.mjs test/device-tracking.test.mjs
+          while IFS= read -r file; do
+            case "$file" in
+              src/web/device-pairing.js|src/web/device-tracking.js|src/web/device-tracking-core.js|scripts/apply-tracking.mjs|test/device-tracking.test.mjs) ;;
+              *) echo "Arquivo inesperado: $file"; exit 1 ;;
+            esac
+          done < <(git diff --cached --name-only)
+          if git diff --cached --quiet; then
+            echo 'Integracao ja esta presente; sem modificacoes.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Add opt-in native tracking diagnostic collector [test branch]'
+          git push origin HEAD:multidevice-test
