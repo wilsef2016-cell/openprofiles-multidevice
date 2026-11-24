@@ -102,7 +102,10 @@ function renamesFromForm(body) {
  * `settings` (core/settings.js) holds what the Server tab changes; the pages
  * read it on every request, so a save shows at once.
  */
-export function createApp({ config, db, accounts, log, settings = new Settings({ db }), startedAt = Date.now(), uploadReadMs = 2 * 60 * 1000 }) {
+export function createApp({
+  config, db, accounts, log, settings = new Settings({ db }), startedAt = Date.now(),
+  uploadReadMs = 2 * 60 * 1000, historyCatalogUpstream,
+}) {
   const app = express();
   const auth = createAuth({ db, config });
   const themeVersion = () => crypto.createHash('sha1').update(themeCss(settings.branding())).digest('hex').slice(0, 10);
@@ -217,7 +220,8 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
 
   // Stremio-facing routes, guarded by each account's add-on token rather than a session.
   app.use(createAddonRouter({ config, accounts, log, settings }));
-  const devices = process.env.MULTIDEVICE_MODE === 'true' ? createDevicePairingRouter({ db, auth, config }) : null;
+  const devices = process.env.MULTIDEVICE_MODE === 'true'
+    ? createDevicePairingRouter({ db, auth, config, historyCatalogUpstream }) : null;
   if (devices) app.use('/devices', devices);
   const deviceView = (req) => devices ? { deviceProfileId: devices.currentBrowser(req)?.profile_id ?? null } : {};
 

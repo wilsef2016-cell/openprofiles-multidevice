@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { createNativeTrackingRouter } from './device-tracking.js';
 import { createDeviceNetworkBridge } from './device-network-bridge.js';
 import { createDeviceNativeHistory } from './device-native-history.js';
+import { createDeviceHistoryCatalog } from './device-history-catalog.js';
 import { fileURLToPath } from 'node:url';
 import { renderDevicePlayer } from './device-player-page.js';
 import {CODE_TTL_MS,DEVICE_TTL_MS,esc,normalizedCode,pairingCode,randomSecret,sameSiteRequest,sha,validProgress} from './device-core.js';
@@ -12,7 +13,7 @@ import {CODE_TTL_MS,DEVICE_TTL_MS,esc,normalizedCode,pairingCode,randomSecret,sa
  * Não intercepta nem altera a API nativa da conta Stremio.
  * A sessão de aparelho é vinculada a ESTE navegador/cliente, não ao IP ou MAC.
  */
-export function createDevicePairingRouter({ db, auth, config }) {
+export function createDevicePairingRouter({ db, auth, config, historyCatalogUpstream }) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS mp_pair_codes (
       code_hash TEXT PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -100,6 +101,7 @@ export function createDevicePairingRouter({ db, auth, config }) {
   networkBridge = createDeviceNetworkBridge({ db, requireDevice, originOkay, page, config, resetPlayback: nativeHistory.resetPlayback });
   router.use('/bridge', networkBridge.router);
   router.use('/native-history', nativeHistory.router);
+  router.use('/history-catalog', createDeviceHistoryCatalog({ db, auth, originOkay, page, config, historyCatalogUpstream }));
   router.get('/',auth.require,(req,res)=> {
     const profiles=profilesFor.all(req.session.accountId);
     const devices=devicesFor.all(req.session.accountId);

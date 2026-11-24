@@ -126,7 +126,8 @@ export function createDeviceNativeHistory({ db, auth, originOkay, page, currentB
       <h2>Progresso experimental por perfil</h2>
       ${profile ? `<form method="get" action="${path}">
         <label>Perfil <select name="profileId">${profiles.map(p => `<option value="${p.id}"${p.id === profile.id ? ' selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
-        <button>Ver progresso</button></form>` : ''}
+        <button>Ver progresso</button></form>
+        <p><a href="/devices/history-catalog?profileId=${profile.id}">Autorizar catálogo no Stremio</a></p>` : ''}
       ${items.length ? `<ul>${items.map(item => `<li>${esc(item.video_id)} · ${Math.floor(item.position_ms / 1000)} s · hipótese por rede</li>`).join('')}</ul>` : '<p>Nenhum progresso atribuído a este perfil.</p>'}
       <h2>Atribuições para revisar</h2>
       ${review.length ? `<ol>${review.map(item => `<li>${esc(item.video_id)} · ${esc(item.label)} · ${new Date(item.received_at).toISOString()}
