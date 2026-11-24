@@ -2,6 +2,7 @@ import express from 'express';
 import crypto from 'node:crypto';
 import { createNativeTrackingRouter } from './device-tracking.js';
 import { createDeviceNetworkBridge } from './device-network-bridge.js';
+import { createDeviceNativeHistory } from './device-native-history.js';
 import { fileURLToPath } from 'node:url';
 import { renderDevicePlayer } from './device-player-page.js';
 import {CODE_TTL_MS,DEVICE_TTL_MS,esc,normalizedCode,pairingCode,randomSecret,sameSiteRequest,sha,validProgress} from './device-core.js';
@@ -89,37 +90,44 @@ export function createDevicePairingRouter({ db, auth, config }) {
     }
     return next();
   };
-  // MULTIDEVICE_TRACKING_V03: eventos nativos SEM atribuição a aparelho/perfil.
-  // MULTIDEVICE_NETWORK_BRIDGE_V04: ponte por rede, nunca altera mp_progress.
+  const currentBrowser = (req, now = Date.now()) => {
+    const token = parseCookie(req);
+    return token ? pairedBrowser.get(sha(token), req.session.accountId, now) : null;
+  };
+  const nativeHistory = createDeviceNativeHistory({ db, auth, originOkay, page, currentBrowser });
   let networkBridge;
-  router.use('/tracking', createNativeTrackingRouter({ db, auth, config, originOkay, page, resolveBridge: () => networkBridge }));
-  networkBridge = createDeviceNetworkBridge({ db, requireDevice, originOkay, page, config });
+  router.use('/tracking', createNativeTrackingRouter({ db, auth, config, originOkay, page, nativeHistory, resolveBridge: () => networkBridge }));
+  networkBridge = createDeviceNetworkBridge({ db, requireDevice, originOkay, page, config, resetPlayback: nativeHistory.resetPlayback });
   router.use('/bridge', networkBridge.router);
+  router.use('/native-history', nativeHistory.router);
   router.get('/',auth.require,(req,res)=> {
     const profiles=profilesFor.all(req.session.accountId);
     const devices=devicesFor.all(req.session.accountId);
     page(res,'Aparelhos e perfis',`<p><strong>Modo experimental:</strong> cada navegador pareado recebe uma sessão própria; o Stremio nativo NÃO envia essa identidade ao addon. Perfis com PIN não são pareáveis nesta versão.</p><p>Gere um código para o aparelho e digite-o no navegador desse aparelho dentro de 5 minutos.</p>
       <form method="post" action="/devices/new-pair"><input type="hidden" name="_csrf" value="${esc(req.session.csrf)}"><label>Perfil <select name="profileId">${profiles.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label><label>Nome do aparelho <input name="label" maxlength="50" required placeholder="TV da sala"></label><button>Gerar código</button></form>
-      <p><a href="/devices/tracking">Rastreamento nativo experimental (sem perfil atribuído)</a> · <a href="/devices/bridge">Associação automática por rede (experimental)</a></p>
+      <p><a href="/devices/tracking">Diagnóstico do Tracking Addon</a> · <a href="/devices/bridge">Associação automática por rede (experimental)</a> · <a href="/devices/native-history">Histórico experimental do Stremio</a></p>
       <h2>Aparelhos ativos</h2>${devices.length?`<ul>${devices.map(d=>`<li>${esc(d.label)} — ${esc(d.profile_name)} <form method="post" action="/devices/revoke"><input type="hidden" name="_csrf" value="${esc(req.session.csrf)}"><input type="hidden" name="id" value="${esc(d.id)}"><button>Revogar</button></form></li>`).join('')}</ul>`:'<p>Nenhum aparelho vinculado.</p>'}
       <p><a href="/devices/activate">Ativar neste aparelho</a></p>`);
   });
-  const currentBrowser = (req, now = Date.now()) => {
-    const token = parseCookie(req);
-    return token ? pairedBrowser.get(sha(token), req.session.accountId, now) : null;
-  };
-
-  router.post('/select-profile', auth.require, auth.csrf, originOkay, (req, res) => {
+  const changeSelection = db.transaction((req) => {
     const now = Date.now();
     const browser = currentBrowser(req, now);
+    if (!browser) return { error: 'Pareie este navegador com esta conta para selecionar um perfil.' };
     const profileId = typeof req.body?.profileId === 'string' ? Number(req.body.profileId) : NaN;
-    if (!browser) {
-      auth.setFlash(req, { type: 'error', text: 'Pareie este navegador com esta conta para selecionar um perfil.' });
-    } else if (!Number.isSafeInteger(profileId) || profileId < 1 ||
+    if (!Number.isSafeInteger(profileId) || profileId < 1 ||
         !selectProfile.run(profileId, browser.id, req.session.accountId, now, profileId).changes) {
-      auth.setFlash(req, { type: 'error', text: 'Perfil indisponível para seleção neste aparelho.' });
+      return { error: 'Perfil indisponível para seleção neste aparelho.' };
+    }
+    if (browser.profile_id !== profileId) nativeHistory.resetPlayback(browser.id);
+    return { expiresAt: browser.expires_at };
+  });
+
+  router.post('/select-profile', auth.require, auth.csrf, originOkay, (req, res) => {
+    const { error, expiresAt } = changeSelection.immediate(req);
+    if (error) {
+      auth.setFlash(req, { type: 'error', text: error });
     } else {
-      setCookie(res, parseCookie(req), Math.max(0, browser.expires_at - Date.now()));
+      setCookie(res, parseCookie(req), Math.max(0, expiresAt - Date.now()));
       auth.setFlash(req, { type: 'ok', text: 'Perfil atualizado neste aparelho.' });
     }
     return res.redirect(303, '/configure');
@@ -162,7 +170,7 @@ export function createDevicePairingRouter({ db, auth, config }) {
     const history=listProgress.all(d.account_id,d.profile_id);
     page(res,`Aparelho: ${d.label}`,`<p>Perfil associado: <strong>${esc(d.profile_name)}</strong>.</p><p>Esta sessão é deste navegador. Outros aparelhos não serão alterados.</p>
       <h2>Histórico deste perfil</h2>${history.length?`<ol>${history.map(h=>`<li>${esc(h.title)} — ${h.durationMs<60000?Math.round(h.currentMs/1000)+' de '+Math.round(h.durationMs/1000)+' segundos':Math.round(h.currentMs/60000)+' de '+Math.round(h.durationMs/60000)+' minutos'}</li>`).join('')}</ol>`:'<p>Sem registros ainda.</p>'}
-      <p><a href="/devices/player">Abrir player automático experimental</a> · <a href="/devices/bridge">Ativar ponte automática de rede</a></p>
+      <p><a href="/devices/player">Abrir player automático experimental</a> · <a href="/devices/bridge">Ativar ponte automática de rede</a> · <a href="/devices/native-history">Histórico experimental do Stremio</a></p>
       <h2>Atualização manual de teste</h2><form method="post" action="/devices/update"><input type="hidden" name="profileId" value="${d.profile_id}"><label>Tipo <select name="type"><option value="movie">Filme</option><option value="series">Série</option></select></label><label>ID IMDb <input name="mediaId" placeholder="tt0133093" required></label><label>Nome <input name="title" maxlength="120" required></label><label>Minuto atual <input name="minutes" type="number" min="0" required></label><label>Duração em minutos <input name="duration" type="number" min="1" required></label><button>Salvar teste</button></form>
       <p>Para progresso automático, um player compatível precisa chamar <code>POST /devices/progress</code> deste mesmo navegador. O player nativo do Stremio não fornece este vínculo.</p><form method="post" action="/devices/unpair"><button>Desvincular este navegador</button></form>`);
   });

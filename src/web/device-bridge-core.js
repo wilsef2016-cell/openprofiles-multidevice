@@ -38,6 +38,6 @@ export function candidateForNetwork(bindings, eventHash, now) {
   const candidates = bindings.filter(b => b.ip_hash === eventHash &&
     b.expires_at > now && b.device_expires_at > now && b.revoked_at === null);
   if (candidates.length === 0) return { status: 'unmatched', candidate: null };
-  if (candidates.length > 1) return { status: 'ambiguous', candidate: null };
+  if (candidates.length > 1) return { status: 'ambiguous', candidate: null, candidates };
   return { status: 'possible', candidate: candidates[0] };
 }

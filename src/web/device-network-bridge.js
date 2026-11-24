@@ -22,7 +22,7 @@ function observedIp(req, config) {
   return req.ip;
 }
 
-export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, config}) {
+export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, config, resetPlayback}) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS mp_bridge_secret (
       id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL
@@ -51,8 +51,11 @@ export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, 
     VALUES (?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET ip_hash=excluded.ip_hash,
     activated_at=excluded.activated_at,expires_at=excluded.expires_at,account_id=excluded.account_id`);
   const removeBinding = db.prepare('DELETE FROM mp_bridge_bindings WHERE device_id=?');
-  const findBindings = db.prepare(`SELECT b.*, d.profile_id, d.expires_at AS device_expires_at, d.revoked_at
-    FROM mp_bridge_bindings b JOIN mp_devices d ON d.id=b.device_id
+  const findBindings = db.prepare(`SELECT b.*, d.profile_id, d.expires_at AS device_expires_at, d.revoked_at,
+      p.id IS NOT NULL AS profile_available
+    FROM mp_bridge_bindings b JOIN mp_devices d ON d.id=b.device_id AND d.account_id=b.account_id
+    LEFT JOIN profiles p ON p.id=d.profile_id AND p.account_id=d.account_id
+      AND p.deleted_at IS NULL AND p.passcode_hash IS NULL
     WHERE b.account_id=? AND b.ip_hash=? AND b.expires_at>?`);
   const insertCandidate = db.prepare(`INSERT OR IGNORE INTO mp_bridge_candidates
     (event_id,account_id,device_id,profile_id,matched_at) VALUES(?,?,?,?,?)`);
@@ -63,18 +66,28 @@ export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, 
   const prune = db.prepare('DELETE FROM mp_bridge_bindings WHERE expires_at < ?');
   const pruneCandidates = db.prepare('DELETE FROM mp_bridge_candidates WHERE matched_at < ? OR event_id NOT IN (SELECT id FROM mp_tracking_events)');
   const clean = (now=Date.now()) => { prune.run(now); pruneCandidates.run(now - 7*24*60*60*1000); };
+  const bind = db.transaction((device, hash, now) => {
+    upsertBinding.run(device.id,device.account_id,hash,now,now+NETWORK_TTL_MS);
+    resetPlayback(device.id);
+    clean(now);
+  });
+  const removeCandidates = db.prepare('DELETE FROM mp_bridge_candidates WHERE device_id=?');
+  const unbind = db.transaction((deviceId) => {
+    removeBinding.run(deviceId);
+    removeCandidates.run(deviceId);
+    resetPlayback(deviceId);
+  });
 
   function suggest({req,accountId,eventId,now=Date.now()}) {
     clean(now);
     const hash = networkDigest(secret, observedIp(req, config));
-    if (!hash) return 'unavailable';
-    const bindings = findBindings.all(accountId,hash,now);
+    const bindings = hash ? findBindings.all(accountId,hash,now) : [];
     const match = candidateForNetwork(bindings,hash,now);
     if (match.status === 'possible') {
       const device = match.candidate;
       insertCandidate.run(eventId,accountId,device.device_id,device.profile_id,now);
     }
-    return match.status;
+    return match;
   }
   router.get('/',requireDevice,(req,res) => {
     clean();
@@ -84,7 +97,7 @@ export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, 
     const items = recentCandidates.all(d.id);
     page(res,'Ponte automática — diagnóstico',`
       <p><strong>Atenção:</strong> o navegador não consegue fornecer o MAC. Esta ponte registra somente um hash protegido do IP público observado, por até 24 horas. O mesmo IP pode ser compartilhado por vários aparelhos e o Stremio pode usar servidores intermediários.</p>
-      <p>A correspondência de IP é uma <strong>hipótese</strong>, não prova de aparelho. Nenhum evento encontrado aqui altera o histórico confirmado do perfil nem o Continuar Assistindo nativo.</p>
+      <p>A correspondência de IP é uma <strong>hipótese</strong>. A ativação da ponte habilita o diagnóstico. A atribuição automática ao histórico experimental exige consentimento adicional.</p>
       <p><strong>Aparelho:</strong> ${esc(d.label)} · <strong>Perfil:</strong> ${esc(d.profile_name)}</p>
       <p><strong>Associação de rede:</strong> ${active ? `ativa até ${new Date(binding.expires_at).toISOString()}` : 'não ativada ou expirada'}</p>
       <form method="post" action="/devices/bridge/enable">
@@ -95,21 +108,17 @@ export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, 
       <form method="post" action="/devices/bridge/disable"><button>Desativar e apagar associação</button></form>
       <h2>Eventos possivelmente relacionados</h2>
       ${items.length ? `<ol>${items.map(x=>`<li>${esc(x.type)} · ${esc(x.videoId)} · ${esc(x.action)} · ${Math.round(x.currentMs/1000)}s · ${new Date(x.receivedAt).toISOString()} <strong>(hipótese por rede)</strong></li>`).join('')}</ol>` : '<p>Nenhum candidato ainda.</p>'}
-      <p><a href="/devices/me">Voltar ao aparelho</a> · <a href="/devices/tracking">Ver eventos nativos</a></p>`);
+      <p><a href="/devices/me">Voltar ao aparelho</a> · <a href="/devices/tracking">Ver eventos nativos</a> · <a href="/devices/native-history">Histórico experimental do Stremio</a></p>`);
   });
   router.post('/enable',requireDevice,originOkay,(req,res) => {
     if (req.body?.consent !== 'yes') return res.status(400).send('Consentimento obrigatório');
     const hash = networkDigest(secret,observedIp(req, config));
     if (!hash) return res.status(422).send('Não foi possível observar um IP público válido. O serviço pode estar atrás de um proxy. Nada foi registrado.');
-    const d=req.mpDevice, now=Date.now();
-    upsertBinding.run(d.id,d.account_id,hash,now,now+NETWORK_TTL_MS);
-    clean(now);
+    bind(req.mpDevice,hash,Date.now());
     res.redirect(303,'/devices/bridge');
   });
   router.post('/disable',requireDevice,originOkay,(req,res) => {
-    removeBinding.run(req.mpDevice.id);
-    // Remove tentative candidates as well when opting out.
-    db.prepare('DELETE FROM mp_bridge_candidates WHERE device_id=?').run(req.mpDevice.id);
+    unbind(req.mpDevice.id);
     res.redirect(303,'/devices/bridge');
   });
   return {router,suggest};
