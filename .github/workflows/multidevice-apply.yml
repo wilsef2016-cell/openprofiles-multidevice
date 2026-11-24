@@ -1,0 +1,75 @@
+name: Aplicar OpenProfiles MultiDevice (somente teste)
+
+on:
+  push:
+    branches:
+      - multidevice-test
+    paths:
+      - .github/workflows/multidevice-apply.yml
+
+permissions:
+  contents: write
+
+jobs:
+  aplicar:
+    name: Aplicar e verificar alteracoes na branch de teste
+    if: github.ref == 'refs/heads/multidevice-test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar apenas a branch de teste
+        uses: actions/checkout@v4
+        with:
+          ref: multidevice-test
+          persist-credentials: true
+
+      - name: Preparar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Confirmar compatibilidade antes de alterar
+        run: |
+          set -euo pipefail
+          node scripts/apply-integration.mjs . --check
+
+      - name: Aplicar integracao experimental
+        run: |
+          set -euo pipefail
+          node scripts/apply-integration.mjs .
+
+      - name: Verificar sintaxe e diff
+        run: |
+          set -euo pipefail
+          node --check src/web/app.js
+          node --check src/core/service.js
+          node --check src/addon/routes.js
+          node --check src/web/device-pairing.js
+          node --check src/web/device-core.js
+          git diff --check
+
+      - name: Executar testes do OpenProfiles original
+        run: |
+          set -euo pipefail
+          npm ci
+          npm test
+
+      - name: Garantir que apenas os tres arquivos previstos mudaram
+        run: |
+          set -euo pipefail
+          test -n "$(git diff --name-only)" || { echo 'Nenhuma alteracao encontrada.'; exit 1; }
+          while IFS= read -r file; do
+            case "$file" in
+              src/web/app.js|src/core/service.js|src/addon/routes.js) ;;
+              *) echo "Arquivo inesperado: $file"; exit 1 ;;
+            esac
+          done < <(git diff --name-only)
+
+      - name: Salvar alteracoes somente em multidevice-test
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/web/app.js src/core/service.js src/addon/routes.js
+          git commit -m 'Apply experimental MultiDevice pairing patch [test branch]'
+          git push origin HEAD:multidevice-test
