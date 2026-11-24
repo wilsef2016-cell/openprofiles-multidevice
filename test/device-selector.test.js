@@ -129,6 +129,50 @@ test('MultiDevice selects a profile on one paired browser without changing Strem
   assert.equal((await a.request('/devices/history.json')).status, 401);
 });
 
+test('MultiDevice profile cards switch Original → Kids → Original on an existing pairing', async (t) => {
+  const { base, db, fake, repo, original, kids } = await startMultiDevice(t);
+  const browser = new Browser(base);
+  await pair(browser, original.id, 'Sala');
+  const pairedDevice = db.prepare('SELECT * FROM mp_devices WHERE label=?');
+  const before = pairedDevice.get('Sala');
+  const token = browser.jar.get('mp_device');
+  const progress = { type: 'movie', mediaId: 'tt0133093', title: 'Matrix', minutes: 1, duration: 2, profileId: original.id };
+  assert.equal((await browser.request('/devices/update', { method: 'POST', form: progress })).status, 303);
+  const originalHistory = await history(browser);
+  const stremioCalls = fake.calls.length;
+
+  await browser.post('/devices/select-profile', [['profileId', kids.id], ['profileId', kids.id]]);
+  let page = await browser.request('/configure');
+  assert.match(page.text, /Perfil indisponível para seleção neste aparelho/);
+  assert.match(card(page, original.id), /Em uso neste aparelho/);
+
+  for (const profile of [kids, original]) {
+    const selector = card(page, profile.id).match(/<form\b[^>]*action="(\/devices\/select-profile)"[^>]*>([\s\S]*?)<\/form>/);
+    assert.ok(selector, `Selection form for ${profile.name}`);
+    const [, action, form] = selector;
+    // The page's submit handler copies named buttons and disables explicit submit buttons.
+    // The target must be a single hidden field independent of the submit button.
+    const fields = Array.from(form.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)">/g), ([, name, value]) => [name, value]);
+    assert.deepEqual(fields.filter(([name]) => name === 'profileId'), [['profileId', String(profile.id)]]);
+    assert.match(form, /<button type="submit"[^>]*>Usar neste aparelho/);
+    assert.doesNotMatch(form, /<button[^>]*\bname=/);
+
+    const result = await browser.request(action, { method: 'POST', form: fields });
+    assert.equal(result.status, 303);
+    assert.equal(result.location, '/configure');
+    page = await browser.request(result.location);
+    assert.match(page.text, /Perfil atualizado neste aparelho/);
+    assert.match(card(page, profile.id), /Em uso neste aparelho/);
+    assert.deepEqual(pairedDevice.get('Sala'), { ...before, profile_id: profile.id });
+    assert.equal(browser.jar.get('mp_device'), token);
+  }
+
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM mp_devices').get().count, 1);
+  assert.deepEqual(await history(browser), originalHistory);
+  assert.equal(repo.getState().active_profile_id, original.id);
+  assert.equal(fake.calls.length, stremioCalls);
+});
+
 test('MultiDevice checks pairing ownership, expiry, source and profile permission', async (t) => {
   const { accounts, base, db, fake, original, kids, locked, service } = await startMultiDevice(t);
   const browser = new Browser(base);
