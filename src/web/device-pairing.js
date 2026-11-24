@@ -1,5 +1,6 @@
 import express from 'express';
 import crypto from 'node:crypto';
+import { createNativeTrackingRouter } from './device-tracking.js';
 import { fileURLToPath } from 'node:url';
 import { renderDevicePlayer } from './device-player-page.js';
 import {CODE_TTL_MS,DEVICE_TTL_MS,esc,normalizedCode,pairingCode,randomSecret,sameSiteRequest,sha,validProgress} from './device-core.js';
@@ -76,11 +77,14 @@ export function createDevicePairingRouter({ db, auth, config }) {
     }
     return next();
   };
+  // MULTIDEVICE_TRACKING_V03: eventos nativos SEM atribuição a aparelho/perfil.
+  router.use('/tracking', createNativeTrackingRouter({ db, auth, config, originOkay, page }));
   router.get('/',auth.require,(req,res)=> {
     const profiles=profilesFor.all(req.session.accountId);
     const devices=devicesFor.all(req.session.accountId);
     page(res,'Aparelhos e perfis',`<p><strong>Modo experimental:</strong> cada navegador pareado recebe uma sessão própria; o Stremio nativo NÃO envia essa identidade ao addon. Perfis com PIN não são pareáveis nesta versão.</p><p>Gere um código para o aparelho e digite-o no navegador desse aparelho dentro de 5 minutos.</p>
       <form method="post" action="/devices/new-pair"><input type="hidden" name="_csrf" value="${esc(req.session.csrf)}"><label>Perfil <select name="profileId">${profiles.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label><label>Nome do aparelho <input name="label" maxlength="50" required placeholder="TV da sala"></label><button>Gerar código</button></form>
+      <p><a href="/devices/tracking">Rastreamento nativo experimental (sem perfil atribuído)</a></p>
       <h2>Aparelhos ativos</h2>${devices.length?`<ul>${devices.map(d=>`<li>${esc(d.label)} — ${esc(d.profile_name)} <form method="post" action="/devices/revoke"><input type="hidden" name="_csrf" value="${esc(req.session.csrf)}"><input type="hidden" name="id" value="${esc(d.id)}"><button>Revogar</button></form></li>`).join('')}</ul>`:'<p>Nenhum aparelho vinculado.</p>'}
       <p><a href="/devices/activate">Ativar neste aparelho</a></p>`);
   });
