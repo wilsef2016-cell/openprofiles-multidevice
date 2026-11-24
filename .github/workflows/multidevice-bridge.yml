@@ -1,0 +1,168 @@
+name: Instalar ponte automatica MultiDevice v0.4 (diagnostico)
+
+on:
+  push:
+    branches: [multidevice-test]
+    paths: [.github/workflows/multidevice-bridge.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  instalar:
+    name: Aplicar e testar ponte automatica em multidevice-test
+    if: github.ref == 'refs/heads/multidevice-test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar somente branch de teste
+        uses: actions/checkout@v4
+        with:
+          ref: multidevice-test
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Preparar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Confirmar base e branch existentes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = multidevice-test
+          test -f src/web/device-tracking.js
+          test -f src/web/device-pairing.js
+          grep -q 'MULTIDEVICE_TRACKING_V03' src/web/device-pairing.js
+      - name: Extrair arquivos v0.4 validados
+        shell: bash
+        run: |
+          python3 - <<'PY_EXTRACT'
+          import io, base64, zipfile, pathlib
+          blob = '''
+          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
+          '''
+
+          allowed={'src/web/device-bridge-core.js','src/web/device-network-bridge.js','scripts/apply-bridge.mjs','test/device-bridge.test.mjs'}
+          with zipfile.ZipFile(io.BytesIO(base64.b64decode(blob))) as z:
+              assert set(z.namelist()) == allowed
+              for name in sorted(allowed):
+                  path=pathlib.Path(name)
+                  path.parent.mkdir(parents=True,exist_ok=True)
+                  path.write_bytes(z.read(name))
+          print('Arquivos v0.4 preparados sem modificar outros caminhos')
+          PY_EXTRACT
+      - name: Conferir compatibilidade antes de alterar codigo
+        run: node scripts/apply-bridge.mjs --check
+      - name: Aplicar ponte automatica
+        run: node scripts/apply-bridge.mjs
+      - name: Verificar sintaxe e executar testes da ponte
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check src/web/device-bridge-core.js
+          node --check src/web/device-network-bridge.js
+          node --check src/web/device-pairing.js
+          node --check src/web/device-tracking.js
+          node --test test/device-bridge.test.mjs
+      - name: Executar testes existentes do projeto
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm test
+      - name: Salvar alteracoes apenas na branch multidevice-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/web/device-bridge-core.js src/web/device-network-bridge.js src/web/device-pairing.js src/web/device-tracking.js scripts/apply-bridge.mjs test/device-bridge.test.mjs
+          if git diff --cached --quiet; then
+            echo "Nenhuma alteracao nova para salvar"
+          else
+            git commit -m "Add experimental automatic browser-network matching for native tracking"
+            git push origin HEAD:multidevice-test
+          fi
