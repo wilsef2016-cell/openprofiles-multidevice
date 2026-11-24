@@ -1,0 +1,120 @@
+name: Corrigir acesso persistente do aparelho MultiDevice
+
+on:
+  push:
+    branches: [multidevice-test]
+    paths:
+      - .github/workflows/multidevice-session-fix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  corrigir:
+    if: github.ref == 'refs/heads/multidevice-test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar apenas a branch experimental
+        uses: actions/checkout@v4
+        with:
+          ref: multidevice-test
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Corrigir cookie e preservar as sessoes existentes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          file = Path('src/web/device-pairing.js')
+          if not file.is_file():
+              raise SystemExit('Arquivo de pareamento nao encontrado; nenhuma alteracao aplicada.')
+          original = file.read_text(encoding='utf-8')
+          source = original
+
+          # Permite que o cookie seja enviado em navegacoes GET vindas de links externos.
+          # Mantem HttpOnly, Secure em HTTPS, Path e validade de 90 dias.
+          old_cookie = "'SameSite=Strict', 'Path=/devices'"
+          new_cookie = "'SameSite=Lax', 'Path=/devices'"
+          if old_cookie in source:
+              if source.count(old_cookie) != 1:
+                  raise SystemExit('Cookie encontrado em local ambiguo; nenhuma alteracao aplicada.')
+              source = source.replace(old_cookie, new_cookie, 1)
+          elif new_cookie not in source:
+              raise SystemExit('Formato de cookie inesperado; nenhuma alteracao aplicada.')
+
+          old_guard = "const requireDevice = (req,res,next) => {req.mpDevice=device(req);return req.mpDevice?next():res.status(401).set('Cache-Control','no-store').type('text').send('Aparelho não pareado ou sessão expirada. Abra /devices/activate.');};"
+          new_guard = """// MULTIDEVICE_COOKIE_V03: migra cookies Strict antigos ao abrir uma pagina autenticada.
+            // A duracao e sempre limitada ao vencimento original no banco; nao renova o token.
+            const requireDevice = (req,res,next) => {
+              req.mpDevice = device(req);
+              if (!req.mpDevice) return res.status(401).set('Cache-Control','no-store').type('text').send('Aparelho não pareado ou sessão expirada. Abra /devices/activate.');
+              if (req.method === 'GET' && (req.path === '/me' || req.path === '/player')) {
+                const token = parseCookie(req);
+                const remainingMs = Math.max(0, req.mpDevice.expires_at - Date.now());
+                setCookie(res, token, remainingMs);
+              }
+              return next();
+            };"""
+          if old_guard in source:
+              if source.count(old_guard) != 1:
+                  raise SystemExit('Guarda de sessao ambigua; nenhuma alteracao aplicada.')
+              source = source.replace(old_guard, new_guard, 1)
+          elif 'MULTIDEVICE_COOKIE_V03' not in source:
+              raise SystemExit('Guarda de sessao desconhecida; nenhuma alteracao aplicada.')
+
+          # Verificacoes que protegem a seguranca e a persistencia existente.
+          checks = [
+              "'SameSite=Lax'", "'HttpOnly'", "'Path=/devices'", 'Max-Age=',
+              "flags.push('Secure')", 'MULTIDEVICE_COOKIE_V03',
+              'req.mpDevice.expires_at - Date.now()', "req.path === '/player'",
+              "req.path === '/me'", 'router.post(\'/progress\'',
+              'MULTIDEVICE_PLAYER_V02',
+          ]
+          missing = [x for x in checks if x not in source]
+          if missing:
+              raise SystemExit('Validacao falhou, faltam trechos: ' + ', '.join(missing))
+          if source != original:
+              file.write_text(source, encoding='utf-8')
+              print('Correcao de cookie aplicada com migracao dos aparelhos ja pareados.')
+          else:
+              print('Correcao ja presente; nenhuma mudanca necessaria.')
+          PY
+
+      - name: Validar sintaxe e limites da modificacao
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check src/web/device-pairing.js
+          git diff --check
+          test "$(git diff --name-only | wc -l)" -le 1
+          if test -n "$(git diff --name-only)"; then
+            test "$(git diff --name-only)" = 'src/web/device-pairing.js'
+          fi
+
+      - name: Instalar dependencias e executar testes do OpenProfiles
+        run: |
+          npm ci
+          npm test
+
+      - name: Salvar somente a correcao na branch multidevice-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add src/web/device-pairing.js
+          if git diff --cached --quiet; then
+            echo 'Codigo ja corrigido. Nenhum commit necessario.'
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m 'Fix persistent device cookie for cross-site navigation'
+            git push origin HEAD:multidevice-test
+          fi
