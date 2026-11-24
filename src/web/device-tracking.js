@@ -4,11 +4,10 @@ import { esc } from './device-core.js';
 import { digestToken, newToken, validToken, nativeManifest, parseNativeEvent, TRACKING_RETENTION_MS, TRACKING_MAX_EVENTS_PER_ACCOUNT } from './device-tracking-core.js';
 
 /**
- * Experimental account-level native event collector.
- * DO NOT attribute events to device/profile based on IP, user-agent, or the installed addon token.
- * Does not modify mp_progress or the native Stremio history.
+ * Collects account-level native events and passes probable matches to the opt-in history.
+ * The install token authorizes collection for the account. It carries no device identity.
  */
-export function createNativeTrackingRouter({db, auth, config, originOkay, page, resolveBridge}) {
+export function createNativeTrackingRouter({db, auth, config, originOkay, page, nativeHistory, resolveBridge}) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS mp_tracking_installs (
       id TEXT PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -23,13 +22,20 @@ export function createNativeTrackingRouter({db, auth, config, originOkay, page, 
       received_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS mp_tracking_events_account ON mp_tracking_events(account_id, received_at);
+    CREATE TABLE IF NOT EXISTS mp_native_history_outcomes (
+      event_id INTEGER PRIMARY KEY REFERENCES mp_tracking_events(id) ON DELETE CASCADE,
+      status TEXT NOT NULL
+    );
   `);
   const router = express.Router();
   const activeInstall = db.prepare('SELECT * FROM mp_tracking_installs WHERE token_hash=? AND revoked_at IS NULL');
   const listInstalls = db.prepare('SELECT id, created_at FROM mp_tracking_installs WHERE account_id=? AND revoked_at IS NULL ORDER BY created_at DESC');
-  const listEvents = db.prepare(`SELECT type, video_id AS videoId, action, current_ms AS currentMs,
-    duration_ms AS durationMs, received_at AS receivedAt FROM mp_tracking_events
-    WHERE account_id=? ORDER BY id DESC LIMIT 30`);
+  const listEvents = db.prepare(`SELECT e.type, e.video_id AS videoId, e.action, e.current_ms AS currentMs,
+    e.duration_ms AS durationMs, e.received_at AS receivedAt,
+    CASE WHEN h.undone_at IS NOT NULL THEN 'undone' ELSE o.status END AS status
+    FROM mp_tracking_events e LEFT JOIN mp_native_history_outcomes o ON o.event_id=e.id
+    LEFT JOIN mp_native_history_events h ON h.source_event_id=e.id
+    WHERE e.account_id=? ORDER BY e.id DESC LIMIT 30`);
   const addInstall = db.prepare('INSERT INTO mp_tracking_installs (id, account_id, token_hash, created_at) VALUES (?,?,?,?)');
   const revoke = db.prepare('UPDATE mp_tracking_installs SET revoked_at=? WHERE id=? AND account_id=? AND revoked_at IS NULL');
   const insertEvent = db.prepare(`INSERT INTO mp_tracking_events
@@ -38,6 +44,33 @@ export function createNativeTrackingRouter({db, auth, config, originOkay, page, 
   const expireEvents = db.prepare('DELETE FROM mp_tracking_events WHERE received_at<?');
   const pruneAccount = db.prepare(`DELETE FROM mp_tracking_events WHERE account_id=? AND id NOT IN
     (SELECT id FROM mp_tracking_events WHERE account_id=? ORDER BY id DESC LIMIT ?)`);
+  const saveOutcome = db.prepare('INSERT INTO mp_native_history_outcomes (event_id,status) VALUES (?,?)');
+  const attribute = db.transaction(({req, accountId, eventId, event, now}) => {
+    const match = resolveBridge()?.suggest({req, accountId, eventId, now}) ?? { status: 'unmatched' };
+    saveOutcome.run(eventId, nativeHistory.record({accountId, eventId, event, match, now}));
+  });
+  const receive = db.transaction((req, installation, event, now) => {
+    const accountId = installation.account_id;
+    const { lastInsertRowid } = insertEvent.run(accountId, installation.id, event.type, event.videoId,
+      event.action, event.currentMs, event.durationMs, now);
+    try {
+      attribute({req, accountId, eventId: Number(lastInsertRowid), event, now});
+    } catch (error) {
+      // Keep the raw diagnostic event if the experimental assignment fails.
+      console.error('[MultiDevice network diagnostic] Failed to attribute tentative event:', error.message);
+    }
+    expireEvents.run(now - TRACKING_RETENTION_MS);
+    pruneAccount.run(accountId, accountId, TRACKING_MAX_EVENTS_PER_ACCOUNT);
+  });
+  const outcomes = {
+    assigned: 'Atribuição experimental por rede',
+    ambiguous: 'Sem atribuição (rede ambígua)',
+    disabled: 'Sem atribuição (experimento desativado)',
+    duplicate: 'Sem nova atribuição (evento repetido)',
+    'profile-unavailable': 'Sem atribuição (perfil indisponível)',
+    'no-start': 'Sem atribuição (sem início compatível)',
+    undone: 'Atribuição desfeita',
+  };
   const getInstall = token => validToken(token) ? activeInstall.get(digestToken(token)) : null;
   const cors = (req,res,next) => {
     res.set('Access-Control-Allow-Origin','*');
@@ -55,7 +88,7 @@ export function createNativeTrackingRouter({db, auth, config, originOkay, page, 
     const installs = listInstalls.all(accountId);
     const events = listEvents.all(accountId);
     page(res,'Tracking nativo — diagnóstico',`
-      <p><strong>Experimento:</strong> recebe ações do player nativo de TODOS os aparelhos da mesma conta Stremio. Sem identificação confiável do aparelho, nenhum evento é enviado ao histórico de um perfil.</p>
+      <p><strong>Experimento:</strong> recebe ações do player nativo de todos os aparelhos da conta Stremio que enviarem eventos. A atribuição provável por rede depende da ativação voluntária no navegador pareado.</p>
       <p>Não registramos IP, User-Agent ou endereço MAC. Os eventos ficam armazenados por até 7 dias e no máximo ${TRACKING_MAX_EVENTS_PER_ACCOUNT} por conta.</p>
       ${extra}
       <h2>Autorizar um coletor de testes</h2>
@@ -65,9 +98,9 @@ export function createNativeTrackingRouter({db, auth, config, originOkay, page, 
       </form>
       <h2>Instalações ativas</h2>${installs.length ? `<ul>${installs.map(d=>`<li>${esc(d.id.slice(0,8))} — criada em ${new Date(d.created_at).toISOString().slice(0,10)}
           <form method="post" action="/devices/tracking/revoke">${csrf(req)}<input type="hidden" name="id" value="${esc(d.id)}"><button>Revogar coletor</button></form></li>`).join('')}</ul>`:'<p>Nenhuma instalação.</p>'}
-      <h2>Eventos recebidos — sem aparelho atribuído</h2>
-      ${events.length ? `<ol>${events.map(e=>`<li>${esc(e.type)} · ${esc(e.videoId)} · ${esc(e.action)} · ${Math.round(e.currentMs/1000)}s / ${Math.round(e.durationMs/1000)}s · ${new Date(e.receivedAt).toISOString()}</li>`).join('')}</ol>`:'<p>Nenhum evento recebido ainda.</p>'}
-      <p><a href="/devices">Voltar aos aparelhos</a></p>`);
+      <h2>Eventos recebidos</h2>
+      ${events.length ? `<ol>${events.map(e=>`<li>${esc(e.type)} · ${esc(e.videoId)} · ${esc(e.action)} · ${Math.round(e.currentMs/1000)}s / ${Math.round(e.durationMs/1000)}s · ${new Date(e.receivedAt).toISOString()} · ${outcomes[e.status] ?? 'Sem atribuição'}</li>`).join('')}</ol>`:'<p>Nenhum evento recebido ainda.</p>'}
+      <p><a href="/devices">Voltar aos aparelhos</a> · <a href="/devices/native-history">Histórico experimental do Stremio</a></p>`);
   };
   router.get('/',auth.require,(req,res)=>dashboard(req,res));
   router.post('/new',auth.require,auth.csrf,originOkay,(req,res)=> {
@@ -93,16 +126,7 @@ export function createNativeTrackingRouter({db, auth, config, originOkay, page, 
     if (!installation) return res.status(404).json({success:false});
     const event = parseNativeEvent(req.params.type,req.params.videoId,req.params.extra);
     if (!event) return res.status(400).json({success:false});
-    const now = Date.now();
-    const result = insertEvent.run(installation.account_id,installation.id,event.type,event.videoId,event.action,event.currentMs,event.durationMs,now);
-    // MULTIDEVICE_NETWORK_BRIDGE_V04: somente candidato; nenhum progresso confirmado alterado.
-    try {
-      resolveBridge?.()?.suggest({req,accountId:installation.account_id,eventId:Number(result.lastInsertRowid),now});
-    } catch (error) {
-      console.error('[MultiDevice network diagnostic] Failed to record tentative candidate:',error?.message);
-    }
-    expireEvents.run(now-TRACKING_RETENTION_MS);
-    pruneAccount.run(installation.account_id,installation.account_id,TRACKING_MAX_EVENTS_PER_ACCOUNT);
+    receive.immediate(req, installation, event, Date.now());
     res.json({success:true});
   });
   return router;

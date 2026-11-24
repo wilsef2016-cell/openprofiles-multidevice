@@ -17,7 +17,7 @@ export function nativeManifest(token) {
     id: `org.openprofiles.multidevice.tracking.${digestToken(token).slice(0,16)}`,
     version: '0.3.0',
     name: 'OpenProfiles - Rastreamento experimental',
-    description: 'Recebe eventos de reproducao desta conta Stremio para diagnostico. Nao identifica aparelhos nem altera os historicos dos perfis.',
+    description: 'Recebe eventos de reproducao desta conta Stremio. OpenProfiles pode atribui-los a um historico experimental por rede, mediante ativacao voluntaria.',
     resources: [{ name: 'player', types: ['movie', 'series'] }],
     types: ['movie','series'],
     catalogs: [],
