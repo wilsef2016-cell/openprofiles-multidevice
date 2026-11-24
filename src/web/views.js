@@ -291,8 +291,9 @@ export function signInPage({ site = DEFAULT_SITE, error, notice, email = '', aga
   });
 }
 
-function recoveryBanner(j, csrf) {
+function recoveryBanner(j, csrf, multiDevice) {
   if (!j) return '';
+  const finishBlocked = multiDevice && j.kind === 'switch';
   const what = j.kind === 'switch'
     ? html`switching from <strong>${j.fromName ?? '(none)'}</strong> to <strong>${j.toName ?? '(deleted)'}</strong>`
     : html`restoring the backup <strong>${j.targetBackup?.label ?? '(deleted)'}</strong>`;
@@ -301,8 +302,9 @@ function recoveryBanner(j, csrf) {
     <p>On ${when(j.started_at)}, ${what} stopped partway, so the Stremio account may be a mix of both.
       Nothing else can change until this is resolved.</p>
     ${j.error ? html`<p class="hint">Reason: ${j.error}</p>` : ''}
+    ${finishBlocked ? html`<p class="hint">No modo MultiDevice, é possível recuperar o estado anterior da conta Stremio.</p>` : ''}
     <div class="row">
-      ${postButton({ action: '/recovery/finish', csrf, label: j.kind === 'switch' ? `Finish switching to ${j.toName ?? 'the target'}` : 'Finish restoring', style: 'primary' })}
+      ${finishBlocked ? '' : postButton({ action: '/recovery/finish', csrf, label: j.kind === 'switch' ? `Finish switching to ${j.toName ?? 'the target'}` : 'Finish restoring', style: 'primary' })}
       ${postButton({ action: '/recovery/rollback', csrf, label: j.kind === 'switch' ? `Go back to ${j.fromName ?? 'the previous state'}` : 'Go back to before the restore' })}
     </div>
   </section>`;
@@ -310,11 +312,22 @@ function recoveryBanner(j, csrf) {
 
 // ── Profiles tab ─────────────────────────────────────────────────────────────
 
-function profileCard(p, { active, csrf, locked, editing }) {
+function profileCard(p, { active, csrf, locked, editing, multiDevice }) {
+  const selection = multiDevice
+    ? active ? '' : p.has_passcode
+      ? html`<span class="hint">Perfil protegido por PIN</span>`
+      : html`<form class="grow" method="post" action="/devices/select-profile">
+          ${csrfField(csrf)}
+          <button class="primary grow" name="profileId" value="${p.id}">Usar neste aparelho<span class="sr-only">: ${p.name}</span></button>
+        </form>`
+    : active
+      ? postButton({ action: `/profiles/${p.id}/save`, csrf, label: html`Save now<span class="sr-only"> ${p.name}</span>`, style: 'grow', disabled: locked })
+      : postButton({ action: `/profiles/${p.id}/switch`, csrf, label: html`Switch<span class="sr-only"> to ${p.name}</span>`, style: 'primary grow', disabled: locked });
+
   return html`<article class="profile ${active ? 'is-active' : ''} ${editing ? 'is-editing' : ''}">
     <div class="profile-banner" style="background:${p.avatar_colour}">
       <img src="${avatarUrl(p)}" alt="" width="256" height="256">
-      ${active ? html`<span class="pill">In use</span>` : ''}
+      ${active ? html`<span class="pill">${multiDevice ? 'Em uso neste aparelho' : 'In use'}</span>` : ''}
     </div>
     <div class="profile-body">
       <div>
@@ -322,9 +335,7 @@ function profileCard(p, { active, csrf, locked, editing }) {
         <p class="hint">${counts(p, { notifs: false })}</p>
       </div>
       <div class="profile-actions">
-        ${active
-          ? postButton({ action: `/profiles/${p.id}/save`, csrf, label: html`Save now<span class="sr-only"> ${p.name}</span>`, style: 'grow', disabled: locked })
-          : postButton({ action: `/profiles/${p.id}/switch`, csrf, label: html`Switch<span class="sr-only"> to ${p.name}</span>`, style: 'primary grow', disabled: locked })}
+        ${selection}
         ${editing
           ? html`<a class="button is-current" href="/configure" aria-expanded="true">Close<span class="sr-only"> ${p.name}'s editor</span></a>`
           : html`<a class="button" href="/profiles/${p.id}#edit">Edit<span class="sr-only"> ${p.name}</span></a>`}
@@ -456,9 +467,10 @@ function profileEditor(d, { csrf, locked, fresh }) {
 }
 
 /** `fresh`: this session's sign-in was a few minutes ago (a forgotten passcode can be reset). */
-export function profilesPage({ site, csrf, flash, status, addon, undo, editing = null, fresh = false }) {
+export function profilesPage({ site, csrf, flash, status, addon, undo, editing = null, fresh = false, deviceProfileId }) {
   const { account, profiles, activeProfileId, openJournal } = status;
   const locked = Boolean(openJournal);
+  const multiDevice = deviceProfileId !== undefined;
   return layout({
     site,
     title: editing ? `Edit ${editing.profile.name}` : 'Profiles',
@@ -466,17 +478,19 @@ export function profilesPage({ site, csrf, flash, status, addon, undo, editing =
     csrf,
     tab: 'profiles',
     body: html`${flashBlock(flash)}
-    ${recoveryBanner(openJournal, csrf)}
+    ${recoveryBanner(openJournal, csrf, multiDevice)}
     ${undoBanner(undo, csrf)}
-    ${getStarted({ profiles, addon })}
+    ${multiDevice ? '' : getStarted({ profiles, addon })}
 
     <section class="stack-lg">
       <div class="section-head">
         <h1>Profiles</h1>
-        <p class="hint">Switching changes every device on this Stremio account</p>
+        ${multiDevice
+          ? html`<p class="hint">Selecione o perfil deste navegador. <a href="/devices">Gerenciar aparelhos</a> · <a href="/devices/activate">Parear</a> · <a href="/devices/me">Ver este aparelho</a></p>`
+          : html`<p class="hint">Switching changes every device on this Stremio account</p>`}
       </div>
       <div class="grid">
-        ${profiles.map((p) => profileCard(p, { active: p.id === activeProfileId, csrf, locked, editing: editing?.profile.id === p.id }))}
+        ${profiles.map((p) => profileCard(p, { active: p.id === (multiDevice ? deviceProfileId : activeProfileId), csrf, locked, multiDevice, editing: editing?.profile.id === p.id }))}
         ${profiles.length < MAX_PROFILES ? html`<a class="new-tile" href="/profiles/new">${icon.plus}New profile</a>` : ''}
       </div>
     </section>
@@ -578,7 +592,7 @@ function cinemetaSwitches(prefix, settings) {
  * and keeps the add-on ticks and Cinemeta switches in step with "Start from";
  * without it, every step shows and the form still works.
  */
-export function wizardPage({ site, csrf, account, options, error = null, values = {} }) {
+export function wizardPage({ site, csrf, account, options, error = null, values = {}, multiDevice = false }) {
   const { starts, pool, activeName } = options;
   const from = values.from ?? 'empty';
   const sourceStart = starts.profiles.find((p) => String(p.id) === String(values.source)) ?? null;
@@ -678,8 +692,8 @@ export function wizardPage({ site, csrf, account, options, error = null, values 
             <dt>Cinemeta</dt><dd data-review="cinemeta">—</dd>
           </dl>
         </div>
-        <label class="radio"><input type="checkbox" name="switchNow" value="1" ${values.switchNow ? 'checked' : ''}> Switch to it right after creating it</label>
-        <p class="hint">Creating it doesn't change Stremio. Your account only changes when you switch to it.</p>
+        ${multiDevice ? '' : html`<label class="radio"><input type="checkbox" name="switchNow" value="1" ${values.switchNow ? 'checked' : ''}> Switch to it right after creating it</label>
+        <p class="hint">Creating it doesn't change Stremio. Your account only changes when you switch to it.</p>`}
       </section>
 
       <div class="wizard-foot">
@@ -997,7 +1011,7 @@ export function restorePreviewPage({ site, csrf, backup, active, locked, account
 
 // ── Install tab ──────────────────────────────────────────────────────────────
 
-export function installPage({ site, csrf, account, flash, addon }) {
+export function installPage({ site, csrf, account, flash, addon, multiDevice = false }) {
   const status = addon?.installed === true
     ? html`<span class="status status-ok">${icon.check} Installed on this account</span>`
     : addon?.installed === false ? html`<span class="status">Not installed yet</span>` : '';
@@ -1010,7 +1024,7 @@ export function installPage({ site, csrf, account, flash, addon }) {
     body: html`${flashBlock(flash)}
     <section class="card" id="install">
       <div class="card-head">
-        <h1 class="h2">Switch from inside Stremio</h1>
+        <h1 class="h2">${multiDevice ? 'Abrir perfis pelo Stremio' : 'Switch from inside Stremio'}</h1>
         ${status}
       </div>
       <p class="lede">Adds a <strong>Switch profile</strong> row to Stremio's Home. Every profile keeps it.</p>
@@ -1018,15 +1032,15 @@ export function installPage({ site, csrf, account, flash, addon }) {
         <a class="button primary" href="${addon.installUrl}">Install in Stremio</a>
         <button type="button" data-copy="${addon.manifestUrl}" data-copied="Copied">Copy add-on link</button>
       </div>` : ''}
-      <ol class="steps">
+      ${multiDevice ? html`<p>Abra um perfil na fila do OpenProfiles para acessar o seletor no navegador pareado.</p>` : html`<ol class="steps">
         <li><span class="step-n">1</span><span>Install it once, on any device. It appears on every device signed in to this Stremio account.</span></li>
         <li><span class="step-n">2</span><span>On Home, open a profile in the <strong>Switch profile</strong> row. That switches.</span></li>
         <li><span class="step-n">3</span><span>Tap its stream to refresh Stremio, on phones, TVs and desktop alike.</span></li>
-      </ol>
+      </ol>`}
     </section>
     ${addon ? html`<section class="card">
       <h2>The link is a password</h2>
-      <p class="hint">Anyone with the add-on link can switch this account's profile. If it leaks, get a
+      <p class="hint">${multiDevice ? 'O link identifica esta conta no add-on.' : "Anyone with the add-on link can switch this account's profile."} If it leaks, get a
         new link: the old one stops working, and if the add-on is installed, Stremio's copy is updated
         for you.</p>
       <div class="row align-end">

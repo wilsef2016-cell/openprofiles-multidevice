@@ -44,7 +44,15 @@ export function createDevicePairingRouter({ db, auth, config }) {
   const spendCode = db.prepare('UPDATE mp_pair_codes SET used_at=? WHERE code_hash=? AND used_at IS NULL');
   const addDevice = db.prepare(`INSERT INTO mp_devices(id,account_id,profile_id,label,token_hash,created_at,expires_at) VALUES(?,?,?,?,?,?,?)`);
   const deviceByToken = db.prepare(`SELECT d.*, p.name AS profile_name FROM mp_devices d
-    JOIN profiles p ON p.id=d.profile_id WHERE d.token_hash=? AND d.revoked_at IS NULL AND d.expires_at>? AND p.deleted_at IS NULL AND p.passcode_hash IS NULL`);
+    JOIN profiles p ON p.id=d.profile_id AND p.account_id=d.account_id WHERE d.token_hash=? AND d.revoked_at IS NULL AND d.expires_at>? AND p.deleted_at IS NULL AND p.passcode_hash IS NULL`);
+  const pairedBrowser = db.prepare(`SELECT d.id, d.expires_at, p.id AS profile_id FROM mp_devices d
+    LEFT JOIN profiles p ON p.id=d.profile_id AND p.account_id=d.account_id
+      AND p.deleted_at IS NULL AND p.passcode_hash IS NULL
+    WHERE d.token_hash=? AND d.account_id=? AND d.revoked_at IS NULL AND d.expires_at>?`);
+  const selectProfile = db.prepare(`UPDATE mp_devices SET profile_id=?
+    WHERE id=? AND account_id=? AND revoked_at IS NULL AND expires_at>?
+      AND EXISTS (SELECT 1 FROM profiles WHERE id=? AND account_id=mp_devices.account_id
+        AND deleted_at IS NULL AND passcode_hash IS NULL)`);
   const revokeOne = db.prepare('UPDATE mp_devices SET revoked_at=? WHERE account_id=? AND id=? AND revoked_at IS NULL');
   const revokeToken = db.prepare('UPDATE mp_devices SET revoked_at=? WHERE id=? AND revoked_at IS NULL');
   const listProgress = db.prepare(`SELECT media_id AS mediaId,video_id AS videoId,type,title,current_ms AS currentMs,
@@ -61,13 +69,16 @@ export function createDevicePairingRouter({ db, auth, config }) {
   const parseCookie = (req) => (req.get('cookie') || '').split(';').map(x=>x.trim()).find(x=>x.startsWith(cookieName+'='))?.slice(cookieName.length+1) || '';
   const device = req => { const secret=parseCookie(req);return secret ? deviceByToken.get(sha(secret),Date.now()) : null; };
   const setCookie = (res, token, ageMs) => {
-    const flags = [`${cookieName}=${token}`, 'HttpOnly', 'SameSite=Lax', 'Path=/devices', `Max-Age=${Math.floor(ageMs/1000)}`];
+    const flags = ['HttpOnly', 'SameSite=Lax'];
     if (config.publicUrl.startsWith('https://')) flags.push('Secure');
-    res.set('Set-Cookie',flags.join('; '));
+    // Retire the narrower cookie so it cannot shadow the root cookie on /devices.
+    res.append('Set-Cookie', [
+      [`${cookieName}=`, 'Path=/devices', 'Max-Age=0', ...flags].join('; '),
+      [`${cookieName}=${token}`, 'Path=/', `Max-Age=${Math.floor(ageMs / 1000)}`, ...flags].join('; '),
+    ]);
   };
   const originOkay = (req,res,next) => sameSiteRequest(req,config.publicUrl) ? next() : res.status(403).send('Origem não autorizada');
-  // MULTIDEVICE_COOKIE_V03: migra cookies Strict antigos ao abrir uma pagina autenticada.
-  // A duracao e sempre limitada ao vencimento original no banco; nao renova o token.
+  // Reissue existing device cookies with the original database expiry.
   const requireDevice = (req,res,next) => {
     req.mpDevice = device(req);
     if (!req.mpDevice) return res.status(401).set('Cache-Control','no-store').type('text').send('Aparelho não pareado ou sessão expirada. Abra /devices/activate.');
@@ -93,6 +104,27 @@ export function createDevicePairingRouter({ db, auth, config }) {
       <h2>Aparelhos ativos</h2>${devices.length?`<ul>${devices.map(d=>`<li>${esc(d.label)} — ${esc(d.profile_name)} <form method="post" action="/devices/revoke"><input type="hidden" name="_csrf" value="${esc(req.session.csrf)}"><input type="hidden" name="id" value="${esc(d.id)}"><button>Revogar</button></form></li>`).join('')}</ul>`:'<p>Nenhum aparelho vinculado.</p>'}
       <p><a href="/devices/activate">Ativar neste aparelho</a></p>`);
   });
+  const currentBrowser = (req, now = Date.now()) => {
+    const token = parseCookie(req);
+    return token ? pairedBrowser.get(sha(token), req.session.accountId, now) : null;
+  };
+
+  router.post('/select-profile', auth.require, auth.csrf, originOkay, (req, res) => {
+    const now = Date.now();
+    const browser = currentBrowser(req, now);
+    const profileId = typeof req.body?.profileId === 'string' ? Number(req.body.profileId) : NaN;
+    if (!browser) {
+      auth.setFlash(req, { type: 'error', text: 'Pareie este navegador com esta conta para selecionar um perfil.' });
+    } else if (!Number.isSafeInteger(profileId) || profileId < 1 ||
+        !selectProfile.run(profileId, browser.id, req.session.accountId, now, profileId).changes) {
+      auth.setFlash(req, { type: 'error', text: 'Perfil indisponível para seleção neste aparelho.' });
+    } else {
+      setCookie(res, parseCookie(req), Math.max(0, browser.expires_at - Date.now()));
+      auth.setFlash(req, { type: 'ok', text: 'Perfil atualizado neste aparelho.' });
+    }
+    return res.redirect(303, '/configure');
+  });
+
   router.post('/new-pair',auth.require,auth.csrf,originOkay,(req,res)=> {
     const profileId=Number(req.body?.profileId);const label=String(req.body?.label||'').trim().slice(0,50);
     if(!label||!Number.isSafeInteger(profileId)||!profileExists.get(req.session.accountId,profileId))return res.status(400).send('Perfil ou nome inválido');
@@ -116,13 +148,13 @@ export function createDevicePairingRouter({ db, auth, config }) {
     if(code.length!==12)return page(res,'Código inválido','<p>Confira o código ou gere outro.</p>',400);
     const consume = db.transaction(() => {
       const record=lookupCode.get(sha(code),now);
-      if(!record)return null;
+      if (!record || !profileExists.get(record.account_id, record.profile_id)) return null;
       if(spendCode.run(now,record.code_hash).changes!==1)return null;
       const token=randomSecret(32);const id=crypto.randomUUID();
       addDevice.run(id,record.account_id,record.profile_id,record.label,sha(token),now,now+DEVICE_TTL_MS);
       return token;
     });
-    const token=consume();if(!token)return page(res,'Código inválido','<p>Código expirado ou já utilizado. Gere outro.</p>',400);
+    const token=consume();if(!token)return page(res,'Código inválido','<p>Código expirado, já utilizado ou perfil indisponível. Gere outro.</p>',400);
     attempts.delete(ip);setCookie(res,token,DEVICE_TTL_MS);res.redirect(303,'/devices/me');
   });
   router.get('/me',requireDevice,(req,res)=>{
@@ -131,7 +163,7 @@ export function createDevicePairingRouter({ db, auth, config }) {
     page(res,`Aparelho: ${d.label}`,`<p>Perfil associado: <strong>${esc(d.profile_name)}</strong>.</p><p>Esta sessão é deste navegador. Outros aparelhos não serão alterados.</p>
       <h2>Histórico deste perfil</h2>${history.length?`<ol>${history.map(h=>`<li>${esc(h.title)} — ${h.durationMs<60000?Math.round(h.currentMs/1000)+' de '+Math.round(h.durationMs/1000)+' segundos':Math.round(h.currentMs/60000)+' de '+Math.round(h.durationMs/60000)+' minutos'}</li>`).join('')}</ol>`:'<p>Sem registros ainda.</p>'}
       <p><a href="/devices/player">Abrir player automático experimental</a> · <a href="/devices/bridge">Ativar ponte automática de rede</a></p>
-      <h2>Atualização manual de teste</h2><form method="post" action="/devices/update"><label>Tipo <select name="type"><option value="movie">Filme</option><option value="series">Série</option></select></label><label>ID IMDb <input name="mediaId" placeholder="tt0133093" required></label><label>Nome <input name="title" maxlength="120" required></label><label>Minuto atual <input name="minutes" type="number" min="0" required></label><label>Duração em minutos <input name="duration" type="number" min="1" required></label><button>Salvar teste</button></form>
+      <h2>Atualização manual de teste</h2><form method="post" action="/devices/update"><input type="hidden" name="profileId" value="${d.profile_id}"><label>Tipo <select name="type"><option value="movie">Filme</option><option value="series">Série</option></select></label><label>ID IMDb <input name="mediaId" placeholder="tt0133093" required></label><label>Nome <input name="title" maxlength="120" required></label><label>Minuto atual <input name="minutes" type="number" min="0" required></label><label>Duração em minutos <input name="duration" type="number" min="1" required></label><button>Salvar teste</button></form>
       <p>Para progresso automático, um player compatível precisa chamar <code>POST /devices/progress</code> deste mesmo navegador. O player nativo do Stremio não fornece este vínculo.</p><form method="post" action="/devices/unpair"><button>Desvincular este navegador</button></form>`);
   });
   // MULTIDEVICE_PLAYER_V02: player web opcional; exige cookie de dispositivo pareado.
@@ -142,7 +174,13 @@ export function createDevicePairingRouter({ db, auth, config }) {
   router.get('/player-client.js',requireDevice,(req,res)=> {
     res.set('Cache-Control','no-store').type('application/javascript').sendFile(fileURLToPath(new URL('./device-player-client.js',import.meta.url)));
   });
-  router.get('/history.json',requireDevice,(req,res)=>res.set('Cache-Control','no-store').json({profile:req.mpDevice.profile_name,items:listProgress.all(req.mpDevice.account_id,req.mpDevice.profile_id)}));
+  const profileChanged = (req, expected) => expected !== undefined && Number(expected) !== req.mpDevice.profile_id;
+  const changedMessage = 'O perfil deste aparelho mudou. Recarregue a página.';
+  router.get('/history.json',requireDevice,(req,res)=> {
+    res.set('Cache-Control','no-store');
+    if (profileChanged(req, req.query.profileId)) return res.status(409).json({error:changedMessage});
+    return res.json({profile:req.mpDevice.profile_name,items:listProgress.all(req.mpDevice.account_id,req.mpDevice.profile_id)});
+  });
   const write = (req, data) => {
     const item=validProgress(data);if(!item)return false;
     const d=req.mpDevice;
@@ -151,16 +189,19 @@ export function createDevicePairingRouter({ db, auth, config }) {
   };
   router.post('/update',requireDevice,originOkay,(req,res)=>{
     const b=req.body||{};
+    if (profileChanged(req, b.profileId)) return res.status(409).send(changedMessage);
     const okay=write(req,{type:b.type,mediaId:b.mediaId,title:b.title,minutes:b.minutes,videoId:b.mediaId,currentMs:Number(b.minutes)*60_000,durationMs:Number(b.duration)*60_000,action:'pause'});
     if(!okay)return res.status(400).send('Dados inválidos');res.redirect(303,'/devices/me');
   });
   router.post('/progress',express.json({limit:'8kb'}),requireDevice,originOkay,(req,res)=> {
     if(req.get('x-device-client')!=='1')return res.status(403).json({error:'Cabeçalho do cliente obrigatório'});
+    if (profileChanged(req, req.body?.profileId)) return res.status(409).json({error:changedMessage});
     if(!write(req,req.body))return res.status(400).json({error:'Evento inválido'});
     res.set('Cache-Control','no-store').json({ok:true,profileId:req.mpDevice.profile_id});
   });
   router.post('/unpair',requireDevice,originOkay,(req,res)=> {
     revokeToken.run(Date.now(),req.mpDevice.id);setCookie(res,'',0);res.redirect(303,'/devices/activate');
   });
+  router.currentBrowser = currentBrowser;
   return router;
 }

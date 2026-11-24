@@ -1,3 +1,4 @@
+/* global document, window */
 /* Player web experimental, executado somente no navegador já pareado. */
 (() => {
   'use strict';
@@ -31,6 +32,7 @@
   function currentPayload(action) {
     if (!active || !Number.isFinite(video.duration) || video.duration <= 0) return null;
     return {
+      profileId: form.dataset.profileId,
       type: active.type,
       mediaId: active.mediaId,
       videoId: active.videoId,
@@ -53,6 +55,7 @@
         cache: 'no-store',
         keepalive,
       });
+      if (response.status === 409) throw new Error('O perfil deste aparelho mudou. Recarregue a página.');
       if (!response.ok) throw new Error(`Servidor retornou ${response.status}. Verifique o pareamento.`);
       if (!keepalive) setStatus(`Progresso salvo: ${formatTime(payload.currentMs / 1000)} (${action}).`);
     }).catch((error) => {
@@ -60,7 +63,9 @@
     });
   }
   async function savedFor(videoId) {
-    const response = await fetch('/devices/history.json', { credentials: 'same-origin', cache: 'no-store' });
+    const query = new URLSearchParams({ profileId: form.dataset.profileId });
+    const response = await fetch(`/devices/history.json?${query}`, { credentials: 'same-origin', cache: 'no-store' });
+    if (response.status === 409) throw new Error('O perfil deste aparelho mudou. Recarregue a página.');
     if (!response.ok) throw new Error('Sessão de aparelho inválida. Abra /devices/activate.');
     const history = await response.json();
     return (history.items || []).find((entry) => entry.videoId === videoId) || null;
