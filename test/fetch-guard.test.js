@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import dns from 'node:dns';
 import http from 'node:http';
 import { after, before, describe, it } from 'node:test';
 import { checkUrl, fetchJson, isPrivateAddress, normaliseAddonUrl } from '../src/core/fetchGuard.js';
@@ -62,8 +63,19 @@ describe('fetch guard: fetching', () => {
     await assert.rejects(fetchJson(`${base}/ok`), (e) => e.code === 'BLOCKED');
   });
 
-  it('checks the address a name resolves to, not only the name', async () => {
-    // "localhost." (trailing dot) gets past the name check and resolves to loopback.
-    await assert.rejects(fetchJson(`http://localhost.:${server.address().port}/ok`), (e) => e.code === 'BLOCKED');
+  it('checks the address a name resolves to, not only the name', async (t) => {
+    const url = `http://localhost.:${server.address().port}/ok`;
+    // Control the resolver's answer so the name check and the address check can
+    // be exercised even on systems that consult external DNS for "localhost.".
+    const lookup = t.mock.method(dns, 'lookup', (name, options, callback) => {
+      assert.equal(name, 'localhost.');
+      assert.equal(options.all, true);
+      queueMicrotask(() => callback(null, [{ address: '127.0.0.1', family: 4 }]));
+    });
+
+    assert.equal(checkUrl(url).hostname, 'localhost.');
+    await assert.rejects(fetchJson(url), (e) => e.code === 'BLOCKED');
+    assert.equal(lookup.mock.callCount(), 1);
+    assert.deepEqual(await fetchJson(url, open), { hello: 'world' });
   });
 });

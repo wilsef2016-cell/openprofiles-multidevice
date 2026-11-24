@@ -5,7 +5,7 @@ export function renderDevicePlayer(device) {
   return `<p><a href="/devices/me">Voltar ao aparelho</a> · <a href="/devices/history.json">Histórico em JSON</a></p>
     <p><strong>Aparelho:</strong> ${esc(device.label)} · <strong>Perfil:</strong> ${esc(device.profile_name)}</p>
     <p>Este player experimental salva o progresso automaticamente no perfil pareado. Ele <strong>não é o player nativo do Stremio</strong>.</p>
-    <form id="player-form" autocomplete="off">
+    <form id="player-form" data-profile-id="${esc(device.profile_id)}" autocomplete="off">
       <p><label>Tipo <select id="media-type"><option value="movie">Filme</option><option value="series">Série</option></select></label></p>
       <p><label>ID IMDb da obra <input id="media-id" required placeholder="tt0133093" pattern="tt[0-9]{5,12}" maxlength="14"></label></p>
       <p><label>ID do vídeo/episódio <input id="video-id" placeholder="Opcional para filme; obrigatório para episódio" maxlength="120"></label></p>

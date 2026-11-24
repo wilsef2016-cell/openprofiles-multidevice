@@ -217,7 +217,9 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
 
   // Stremio-facing routes, guarded by each account's add-on token rather than a session.
   app.use(createAddonRouter({ config, accounts, log, settings }));
-  if (process.env.MULTIDEVICE_MODE === 'true') app.use('/devices', createDevicePairingRouter({ db, auth, config }));
+  const devices = process.env.MULTIDEVICE_MODE === 'true' ? createDevicePairingRouter({ db, auth, config }) : null;
+  if (devices) app.use('/devices', devices);
+  const deviceView = (req) => devices ? { deviceProfileId: devices.currentBrowser(req)?.profile_id ?? null } : {};
 
   const r = express.Router();
   r.use(auth.require, auth.csrf, (req, res, next) => {
@@ -258,7 +260,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
 
   r.get('/configure', (req, res) => {
     const status = req.service.status();
-    return sendPage(res, profilesPage({ ...page(req), status, addon: req.service.addonInfo(), undo: undoFor(req) }));
+    return sendPage(res, profilesPage({ ...page(req), ...deviceView(req), status, addon: req.service.addonInfo(), undo: undoFor(req) }));
   });
 
   r.get('/profiles/new', async (req, res) => {
@@ -274,7 +276,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
       auth.setFlash(req, { type: 'error', text: 'You have as many profiles as an account can have. Delete one first.' });
       return res.redirect(303, '/configure');
     }
-    return sendPage(res, wizardPage({ ...page(req), options }));
+    return sendPage(res, wizardPage({ ...page(req), options, multiDevice: Boolean(devices) }));
   });
 
   // The wizard posts here (and so can a plain form with just a name).
@@ -288,7 +290,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
       picture: isValidAvatar(b.picture) ? b.picture : 'initial',
       addons: b.addons_shown === '1' ? many(b.addon) : null,
       cinemeta: b.cm_shown === '1' ? cinemetaFromForm(b, 'cm_') : null,
-      switchNow: b.switchNow === '1',
+      switchNow: !devices && b.switchNow === '1',
     };
     try {
       const p = await req.service.createProfile({
@@ -307,7 +309,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
         type: 'ok',
         text: switched
           ? `Created "${p.name}" and switched to it. Click back into Stremio and it refreshes (Stremio 5). Other apps: close and reopen them.`
-          : `Created "${p.name}". Stremio changes when you switch to it.`,
+          : devices ? `Perfil "${p.name}" criado.` : `Created "${p.name}". Stremio changes when you switch to it.`,
         details: p.warnings,
       });
       return res.redirect(303, '/configure');
@@ -320,7 +322,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
       // Back to the wizard with what was picked, so nothing has to be done again.
       try {
         const options = await req.service.wizardOptions();
-        return sendPage(res, wizardPage({ ...page(req), options, error: userMessageOf(err), values }), 400);
+        return sendPage(res, wizardPage({ ...page(req), options, multiDevice: Boolean(devices), error: userMessageOf(err), values }), 400);
       } catch {
         auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
         return res.redirect(303, '/configure');
@@ -333,7 +335,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     if (!req.service.repo.getProfile(id)) return notFound(res, 'That profile no longer exists.', req);
     const status = req.service.status();
     return sendPage(res, profilesPage({
-      ...page(req), status, addon: req.service.addonInfo(), undo: undoFor(req), editing: req.service.profileDetails(id), fresh: auth.fresh(req),
+      ...page(req), ...deviceView(req), status, addon: req.service.addonInfo(), undo: undoFor(req), editing: req.service.profileDetails(id), fresh: auth.fresh(req),
     }));
   });
 
@@ -343,6 +345,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   }), status);
 
   r.get('/profiles/:id/unlock', (req, res) => {
+    if (devices) return res.redirect(303, '/configure');
     const p = req.service.repo.getProfile(idParam(req));
     if (!p) return notFound(res, 'That profile no longer exists.', req);
     if (!p.has_passcode || p.id === req.service.repo.getState()?.active_profile_id) return res.redirect(303, '/configure');
@@ -351,6 +354,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
 
   // A locked profile's Switch button posts without a code: that opens its passcode page first.
   r.post('/profiles/:id/switch', async (req, res) => {
+    if (devices) return res.redirect(303, '/configure');
     const id = idParam(req);
     const passcode = typeof req.body.passcode === 'string' ? req.body.passcode : null;
     try {
@@ -694,7 +698,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
 
   // ── Install tab ────────────────────────────────────────────────────────────
 
-  r.get('/install', (req, res) => sendPage(res, installPage({ ...page(req), addon: req.service.addonInfo() })));
+  r.get('/install', (req, res) => sendPage(res, installPage({ ...page(req), addon: req.service.addonInfo(), multiDevice: Boolean(devices) })));
 
   r.post('/addon/rotate', action(async (req) => {
     const info = await req.service.rotateAddonToken();
@@ -887,12 +891,14 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   app.get('/:token/unlock/:id', (req, res) => {
     const hit = unlockTarget(req, res);
     if (!hit) return undefined;
+    if (devices) return res.redirect(303, '/configure');
     return hit.active ? sendUnlocked(req, res, hit, false) : sendUnlockPage(res, hit);
   });
 
   app.post('/:token/unlock/:id', async (req, res) => {
     const hit = unlockTarget(req, res);
     if (!hit) return undefined;
+    if (devices) return res.redirect(303, '/configure');
     if (!takeNonce(hit.account.id, hit.profile.id, req.body?.nonce)) {
       return sendUnlockPage(res, hit, 'This page had expired. Enter the passcode again.', 403);
     }
@@ -909,6 +915,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   app.get('/:token/unlock/:id/done', (req, res) => {
     const hit = unlockTarget(req, res);
     if (!hit) return undefined;
+    if (devices) return res.redirect(303, '/configure');
     return hit.active ? sendUnlocked(req, res, hit, true) : res.redirect(303, `/${hit.token}/unlock/${hit.profile.id}`);
   });
 

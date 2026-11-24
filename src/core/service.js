@@ -1399,6 +1399,9 @@ export class ProfilesService {
       const account = this.requireAccount();
       const j = this.repo.getOpenJournal();
       if (!j) throw new UserError('NOTHING_OPEN', 'There is no unfinished switch.');
+      if (j.kind === 'switch' && process.env.MULTIDEVICE_MODE === 'true') {
+        throw new UserError('MULTIDEVICE', 'O modo MultiDevice não permite concluir uma troca global de perfil.');
+      }
       const row = j.kind === 'switch' ? this.repo.getProfileRow(j.to_profile_id) : this.repo.getBackupRow(j.target_backup_id);
       if (!row) throw new UserError('TARGET_GONE', "The interrupted switch's target no longer exists. Use \"Go back\" instead.");
       const label = j.kind === 'switch' ? row.name : 'The backup';

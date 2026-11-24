@@ -97,6 +97,7 @@ export function createAddonRouter({ config, accounts, log, settings, waitMs = SW
 
   function describe(p, active) {
     const counts = `${p.library_count} title${p.library_count === 1 ? '' : 's'} · ${p.addon_count} add-on${p.addon_count === 1 ? '' : 's'}`;
+    if (process.env.MULTIDEVICE_MODE === 'true') return `${counts}. Abra o OpenProfiles para selecionar um perfil neste navegador.`;
     if (active) return `${counts}.${p.has_passcode ? ' Locked with a passcode.' : ''} This is the profile in use.`;
     return p.has_passcode
       ? `${counts}. Locked: opening this asks for its passcode.`
@@ -211,6 +212,11 @@ export function createAddonRouter({ config, accounts, log, settings, waitMs = SW
     const p = id && service.repo.getProfile(id);
     if (!p) return res.json({ streams: [pageStream("Couldn't switch: that profile no longer exists.\nTap to open OpenProfiles.")] });
 
+    if (process.env.MULTIDEVICE_MODE === 'true') {
+      const link = `${publicUrl}/configure`;
+      return res.json({ streams: [{ name: 'MultiDevice', description: 'Abra o OpenProfiles para selecionar um perfil neste navegador.', externalUrl: link, androidTvUrl: link }] });
+    }
+
     // A locked profile doesn't switch from here. Unlocking switches, so refreshing afterwards
     // (here, or on a TV after unlocking on a phone) lands in it; with no unlock, nothing changes.
     if (p.has_passcode && p.id !== state.active_profile_id) {
@@ -222,10 +228,6 @@ export function createAddonRouter({ config, accounts, log, settings, waitMs = SW
       });
     }
 
-    if (process.env.MULTIDEVICE_MODE === 'true') {
-      const link = `${publicUrl}/devices/activate`;
-      return res.json({ streams: [{ name: 'MultiDevice', description: 'Pareie este aparelho no navegador. Nao muda o perfil global do Stremio.', externalUrl: link, androidTvUrl: link }] });
-    }
     const work = service.switchTo(id);
     const outcome = await Promise.race([
       work.then((result) => ({ result }), (error) => ({ error })),
