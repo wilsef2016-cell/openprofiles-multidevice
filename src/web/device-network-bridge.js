@@ -1,14 +1,28 @@
 import express from 'express';
 import crypto from 'node:crypto';
 import { esc } from './device-core.js';
-import { NETWORK_TTL_MS, networkDigest, candidateForNetwork } from './device-bridge-core.js';
+import { NETWORK_TTL_MS, networkDigest, candidateForNetwork, publicIp } from './device-bridge-core.js';
 
 /**
  * Optional browser-network companion for native Stremio events.
  * IP address is a weak, shared network signal, never a device identifier.
  * This bridge writes only TENTATIVE suggestions, never mp_progress/native history.
  */
-export function createDeviceNetworkBridge({db, requireDevice, originOkay, page}) {
+// MULTIDEVICE_REALIP_V041: read client IP from Railway's sanitized public HTTPS ingress.
+// Only a tentative network correlation; NEVER use this as authentication or device proof.
+// Direct private-network requests can forge forwarded headers, so do not use this
+// signal for access control or for overwriting verified per-profile progress.
+function observedIp(req, config) {
+  const expectedHost = new URL(config.publicUrl).host;
+  const edgeHost = req.get('x-forwarded-host');
+  const edgeProto = req.get('x-forwarded-proto');
+  const realIp = req.get('x-real-ip');
+  if (req.get('host') === expectedHost && edgeHost === expectedHost &&
+      edgeProto === 'https' && publicIp(realIp)) return realIp;
+  return req.ip;
+}
+
+export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, config}) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS mp_bridge_secret (
       id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL
@@ -52,7 +66,7 @@ export function createDeviceNetworkBridge({db, requireDevice, originOkay, page})
 
   function suggest({req,accountId,eventId,now=Date.now()}) {
     clean(now);
-    const hash = networkDigest(secret, req.ip);
+    const hash = networkDigest(secret, observedIp(req, config));
     if (!hash) return 'unavailable';
     const bindings = findBindings.all(accountId,hash,now);
     const match = candidateForNetwork(bindings,hash,now);
@@ -85,7 +99,7 @@ export function createDeviceNetworkBridge({db, requireDevice, originOkay, page})
   });
   router.post('/enable',requireDevice,originOkay,(req,res) => {
     if (req.body?.consent !== 'yes') return res.status(400).send('Consentimento obrigatório');
-    const hash = networkDigest(secret,req.ip);
+    const hash = networkDigest(secret,observedIp(req, config));
     if (!hash) return res.status(422).send('Não foi possível observar um IP público válido. O serviço pode estar atrás de um proxy. Nada foi registrado.');
     const d=req.mpDevice, now=Date.now();
     upsertBinding.run(d.id,d.account_id,hash,now,now+NETWORK_TTL_MS);

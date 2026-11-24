@@ -82,7 +82,7 @@ export function createDevicePairingRouter({ db, auth, config }) {
   // MULTIDEVICE_NETWORK_BRIDGE_V04: ponte por rede, nunca altera mp_progress.
   let networkBridge;
   router.use('/tracking', createNativeTrackingRouter({ db, auth, config, originOkay, page, resolveBridge: () => networkBridge }));
-  networkBridge = createDeviceNetworkBridge({ db, requireDevice, originOkay, page });
+  networkBridge = createDeviceNetworkBridge({ db, requireDevice, originOkay, page, config });
   router.use('/bridge', networkBridge.router);
   router.get('/',auth.require,(req,res)=> {
     const profiles=profilesFor.all(req.session.accountId);
