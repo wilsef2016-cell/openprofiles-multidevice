@@ -318,7 +318,8 @@ function profileCard(p, { active, csrf, locked, editing, multiDevice }) {
       ? html`<span class="hint">Perfil protegido por PIN</span>`
       : html`<form class="grow" method="post" action="/devices/select-profile">
           ${csrfField(csrf)}
-          <button class="primary grow" name="profileId" value="${p.id}">Usar neste aparelho<span class="sr-only">: ${p.name}</span></button>
+          <input type="hidden" name="profileId" value="${p.id}">
+          <button type="submit" class="primary grow">Usar neste aparelho<span class="sr-only">: ${p.name}</span></button>
         </form>`
     : active
       ? postButton({ action: `/profiles/${p.id}/save`, csrf, label: html`Save now<span class="sr-only"> ${p.name}</span>`, style: 'grow', disabled: locked })
