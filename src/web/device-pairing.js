@@ -1,6 +1,7 @@
 import express from 'express';
 import crypto from 'node:crypto';
 import { createNativeTrackingRouter } from './device-tracking.js';
+import { createDeviceNetworkBridge } from './device-network-bridge.js';
 import { fileURLToPath } from 'node:url';
 import { renderDevicePlayer } from './device-player-page.js';
 import {CODE_TTL_MS,DEVICE_TTL_MS,esc,normalizedCode,pairingCode,randomSecret,sameSiteRequest,sha,validProgress} from './device-core.js';
@@ -78,13 +79,17 @@ export function createDevicePairingRouter({ db, auth, config }) {
     return next();
   };
   // MULTIDEVICE_TRACKING_V03: eventos nativos SEM atribuição a aparelho/perfil.
-  router.use('/tracking', createNativeTrackingRouter({ db, auth, config, originOkay, page }));
+  // MULTIDEVICE_NETWORK_BRIDGE_V04: ponte por rede, nunca altera mp_progress.
+  let networkBridge;
+  router.use('/tracking', createNativeTrackingRouter({ db, auth, config, originOkay, page, resolveBridge: () => networkBridge }));
+  networkBridge = createDeviceNetworkBridge({ db, requireDevice, originOkay, page });
+  router.use('/bridge', networkBridge.router);
   router.get('/',auth.require,(req,res)=> {
     const profiles=profilesFor.all(req.session.accountId);
     const devices=devicesFor.all(req.session.accountId);
     page(res,'Aparelhos e perfis',`<p><strong>Modo experimental:</strong> cada navegador pareado recebe uma sessão própria; o Stremio nativo NÃO envia essa identidade ao addon. Perfis com PIN não são pareáveis nesta versão.</p><p>Gere um código para o aparelho e digite-o no navegador desse aparelho dentro de 5 minutos.</p>
       <form method="post" action="/devices/new-pair"><input type="hidden" name="_csrf" value="${esc(req.session.csrf)}"><label>Perfil <select name="profileId">${profiles.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label><label>Nome do aparelho <input name="label" maxlength="50" required placeholder="TV da sala"></label><button>Gerar código</button></form>
-      <p><a href="/devices/tracking">Rastreamento nativo experimental (sem perfil atribuído)</a></p>
+      <p><a href="/devices/tracking">Rastreamento nativo experimental (sem perfil atribuído)</a> · <a href="/devices/bridge">Associação automática por rede (experimental)</a></p>
       <h2>Aparelhos ativos</h2>${devices.length?`<ul>${devices.map(d=>`<li>${esc(d.label)} — ${esc(d.profile_name)} <form method="post" action="/devices/revoke"><input type="hidden" name="_csrf" value="${esc(req.session.csrf)}"><input type="hidden" name="id" value="${esc(d.id)}"><button>Revogar</button></form></li>`).join('')}</ul>`:'<p>Nenhum aparelho vinculado.</p>'}
       <p><a href="/devices/activate">Ativar neste aparelho</a></p>`);
   });
@@ -125,7 +130,7 @@ export function createDevicePairingRouter({ db, auth, config }) {
     const history=listProgress.all(d.account_id,d.profile_id);
     page(res,`Aparelho: ${d.label}`,`<p>Perfil associado: <strong>${esc(d.profile_name)}</strong>.</p><p>Esta sessão é deste navegador. Outros aparelhos não serão alterados.</p>
       <h2>Histórico deste perfil</h2>${history.length?`<ol>${history.map(h=>`<li>${esc(h.title)} — ${h.durationMs<60000?Math.round(h.currentMs/1000)+' de '+Math.round(h.durationMs/1000)+' segundos':Math.round(h.currentMs/60000)+' de '+Math.round(h.durationMs/60000)+' minutos'}</li>`).join('')}</ol>`:'<p>Sem registros ainda.</p>'}
-      <p><a href="/devices/player">Abrir player automático experimental</a></p>
+      <p><a href="/devices/player">Abrir player automático experimental</a> · <a href="/devices/bridge">Ativar ponte automática de rede</a></p>
       <h2>Atualização manual de teste</h2><form method="post" action="/devices/update"><label>Tipo <select name="type"><option value="movie">Filme</option><option value="series">Série</option></select></label><label>ID IMDb <input name="mediaId" placeholder="tt0133093" required></label><label>Nome <input name="title" maxlength="120" required></label><label>Minuto atual <input name="minutes" type="number" min="0" required></label><label>Duração em minutos <input name="duration" type="number" min="1" required></label><button>Salvar teste</button></form>
       <p>Para progresso automático, um player compatível precisa chamar <code>POST /devices/progress</code> deste mesmo navegador. O player nativo do Stremio não fornece este vínculo.</p><form method="post" action="/devices/unpair"><button>Desvincular este navegador</button></form>`);
   });

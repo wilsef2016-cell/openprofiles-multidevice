@@ -8,7 +8,7 @@ import { digestToken, newToken, validToken, nativeManifest, parseNativeEvent, TR
  * DO NOT attribute events to device/profile based on IP, user-agent, or the installed addon token.
  * Does not modify mp_progress or the native Stremio history.
  */
-export function createNativeTrackingRouter({db, auth, config, originOkay, page}) {
+export function createNativeTrackingRouter({db, auth, config, originOkay, page, resolveBridge}) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS mp_tracking_installs (
       id TEXT PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -94,7 +94,13 @@ export function createNativeTrackingRouter({db, auth, config, originOkay, page})
     const event = parseNativeEvent(req.params.type,req.params.videoId,req.params.extra);
     if (!event) return res.status(400).json({success:false});
     const now = Date.now();
-    insertEvent.run(installation.account_id,installation.id,event.type,event.videoId,event.action,event.currentMs,event.durationMs,now);
+    const result = insertEvent.run(installation.account_id,installation.id,event.type,event.videoId,event.action,event.currentMs,event.durationMs,now);
+    // MULTIDEVICE_NETWORK_BRIDGE_V04: somente candidato; nenhum progresso confirmado alterado.
+    try {
+      resolveBridge?.()?.suggest({req,accountId:installation.account_id,eventId:Number(result.lastInsertRowid),now});
+    } catch (error) {
+      console.error('[MultiDevice network diagnostic] Failed to record tentative candidate:',error?.message);
+    }
     expireEvents.run(now-TRACKING_RETENTION_MS);
     pruneAccount.run(installation.account_id,installation.account_id,TRACKING_MAX_EVENTS_PER_ACCOUNT);
     res.json({success:true});
