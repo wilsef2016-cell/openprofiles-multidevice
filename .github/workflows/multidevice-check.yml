@@ -1,0 +1,34 @@
+name: Verificar OpenProfiles MultiDevice
+
+on:
+  push:
+    branches:
+      - multidevice-test
+
+permissions:
+  contents: read
+
+jobs:
+  verificar:
+    name: Conferir integracao sem alterar o projeto
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obter arquivos da branch de teste
+        uses: actions/checkout@v4
+
+      - name: Preparar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verificar sintaxe dos tres arquivos novos
+        run: |
+          node --check src/web/device-core.js
+          node --check src/web/device-pairing.js
+          node --check scripts/apply-integration.mjs
+
+      - name: Conferir se o patch e compativel sem modifica-lo
+        run: node scripts/apply-integration.mjs . --check
+
+      - name: Confirmar que nenhum arquivo foi alterado
+        run: git diff --exit-code
