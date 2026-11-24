@@ -180,7 +180,7 @@ export function createAddonRouter({ config, accounts, log, settings, waitMs = SW
     noStore(res);
     // Any of the row's ids gets the current list: a copy saved under another profile's id is fine too.
     if (req.params.type !== CATALOG_TYPE || !isCatalogId(req.params.id)) return res.json({ metas: [] });
-    const metas = service.repo.listProfiles().map((p) => preview(state.addon_token, p, p.id === state.active_profile_id));
+    const metas = service.repo.listProfiles().map((p) => preview(state.addon_token, p, p.id === state.active_profile_id && process.env.MULTIDEVICE_MODE !== 'true'));
     return res.json({ metas });
   });
   router.get('/:token/catalog/:type/:id.json', cors, catalog);
@@ -191,7 +191,7 @@ export function createAddonRouter({ config, accounts, log, settings, waitMs = SW
     const id = parseProfileMetaId(req.params.id);
     const p = id && service.repo.getProfile(id);
     if (!p) return res.status(404).json({ meta: null });
-    const active = p.id === state.active_profile_id;
+    const active = p.id === state.active_profile_id && process.env.MULTIDEVICE_MODE !== 'true';
     return res.json({
       meta: {
         ...preview(state.addon_token, p, active),
@@ -222,6 +222,10 @@ export function createAddonRouter({ config, accounts, log, settings, waitMs = SW
       });
     }
 
+    if (process.env.MULTIDEVICE_MODE === 'true') {
+      const link = `${publicUrl}/devices/activate`;
+      return res.json({ streams: [{ name: 'MultiDevice', description: 'Pareie este aparelho no navegador. Nao muda o perfil global do Stremio.', externalUrl: link, androidTvUrl: link }] });
+    }
     const work = service.switchTo(id);
     const outcome = await Promise.race([
       work.then((result) => ({ result }), (error) => ({ error })),
@@ -249,7 +253,7 @@ export function createAddonRouter({ config, accounts, log, settings, waitMs = SW
   router.get('/:token/poster/:id.png', withToken(async (req, res, state, service) => {
     const p = service.repo.getProfile(Number(req.params.id));
     if (!p) return res.status(404).end();
-    const active = p.id === state.active_profile_id;
+    const active = p.id === state.active_profile_id && process.env.MULTIDEVICE_MODE !== 'true';
     const locked = Boolean(p.has_passcode);
     // A photo preset names its photo's hash, so the cache key changes with the photo.
     const png = await art.get(`poster|${p.name}|${p.avatar_colour}|${p.avatar_preset}|${active}|${locked}`,

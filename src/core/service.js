@@ -331,7 +331,7 @@ export class ProfilesService {
       const id = this.repo.insertProfile({ name: clean, avatarPreset: picture, avatarColour: colour, stremioUserId: account.stremio_user_id, snapshot });
       this.repo.logActivity('profile', `Created "${clean}"`);
       let switched = null;
-      if (switchNow) {
+      if (switchNow && process.env.MULTIDEVICE_MODE !== 'true') {
         try {
           switched = await this.doSwitch(id);
           warnings.push(...switched.warnings);
@@ -1001,6 +1001,7 @@ export class ProfilesService {
   }
 
   async doSwitch(profileId, { passcode = null, via = 'web' } = {}) {
+    if (process.env.MULTIDEVICE_MODE === 'true') throw new UserError('MULTIDEVICE', 'Troca global desativada: pareie um aparelho em /devices.');
     const account = this.requireAccount();
     const state = this.repo.getState();
     const target = this.repo.getProfileRow(profileId);

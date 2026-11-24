@@ -11,6 +11,7 @@ import { SECTIONS, Settings } from '../core/settings.js';
 import { serverStats } from '../core/stats.js';
 import { randomToken } from '../crypto.js';
 import { createAuth, wantsJson } from './auth.js';
+import { createDevicePairingRouter } from './device-pairing.js';
 import { themeCss } from './theme.js';
 import {
   accountPage, addonManagerPage, adminPage, avatarUrl, backupsPage, errorPage, installPage, managerAddonRow, passcodePage, privacyPage, profilesPage,
@@ -216,6 +217,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
 
   // Stremio-facing routes, guarded by each account's add-on token rather than a session.
   app.use(createAddonRouter({ config, accounts, log, settings }));
+  if (process.env.MULTIDEVICE_MODE === 'true') app.use('/devices', createDevicePairingRouter({ db, auth, config }));
 
   const r = express.Router();
   r.use(auth.require, auth.csrf, (req, res, next) => {
