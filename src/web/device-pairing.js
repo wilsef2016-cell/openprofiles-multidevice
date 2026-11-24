@@ -1,5 +1,7 @@
 import express from 'express';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { renderDevicePlayer } from './device-player-page.js';
 import {CODE_TTL_MS,DEVICE_TTL_MS,esc,normalizedCode,pairingCode,randomSecret,sameSiteRequest,sha,validProgress} from './device-core.js';
 
 /**
@@ -107,9 +109,18 @@ export function createDevicePairingRouter({ db, auth, config }) {
     const d=req.mpDevice;
     const history=listProgress.all(d.account_id,d.profile_id);
     page(res,`Aparelho: ${d.label}`,`<p>Perfil associado: <strong>${esc(d.profile_name)}</strong>.</p><p>Esta sessão é deste navegador. Outros aparelhos não serão alterados.</p>
-      <h2>Histórico deste perfil</h2>${history.length?`<ol>${history.map(h=>`<li>${esc(h.title)} — ${Math.round(h.currentMs/60000)} de ${Math.round(h.durationMs/60000)} minutos</li>`).join('')}</ol>`:'<p>Sem registros ainda.</p>'}
+      <h2>Histórico deste perfil</h2>${history.length?`<ol>${history.map(h=>`<li>${esc(h.title)} — ${h.durationMs<60000?Math.round(h.currentMs/1000)+' de '+Math.round(h.durationMs/1000)+' segundos':Math.round(h.currentMs/60000)+' de '+Math.round(h.durationMs/60000)+' minutos'}</li>`).join('')}</ol>`:'<p>Sem registros ainda.</p>'}
+      <p><a href="/devices/player">Abrir player automático experimental</a></p>
       <h2>Atualização manual de teste</h2><form method="post" action="/devices/update"><label>Tipo <select name="type"><option value="movie">Filme</option><option value="series">Série</option></select></label><label>ID IMDb <input name="mediaId" placeholder="tt0133093" required></label><label>Nome <input name="title" maxlength="120" required></label><label>Minuto atual <input name="minutes" type="number" min="0" required></label><label>Duração em minutos <input name="duration" type="number" min="1" required></label><button>Salvar teste</button></form>
       <p>Para progresso automático, um player compatível precisa chamar <code>POST /devices/progress</code> deste mesmo navegador. O player nativo do Stremio não fornece este vínculo.</p><form method="post" action="/devices/unpair"><button>Desvincular este navegador</button></form>`);
+  });
+  // MULTIDEVICE_PLAYER_V02: player web opcional; exige cookie de dispositivo pareado.
+  router.get('/player',requireDevice,(req,res)=> {
+    res.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; connect-src 'self'; media-src https: blob:; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; form-action 'self'; base-uri 'none'");
+    page(res,'Player automático · MultiDevice',renderDevicePlayer(req.mpDevice));
+  });
+  router.get('/player-client.js',requireDevice,(req,res)=> {
+    res.set('Cache-Control','no-store').type('application/javascript').sendFile(fileURLToPath(new URL('./device-player-client.js',import.meta.url)));
   });
   router.get('/history.json',requireDevice,(req,res)=>res.set('Cache-Control','no-store').json({profile:req.mpDevice.profile_name,items:listProgress.all(req.mpDevice.account_id,req.mpDevice.profile_id)}));
   const write = (req, data) => {
