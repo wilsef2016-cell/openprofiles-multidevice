@@ -59,12 +59,23 @@ export function createDevicePairingRouter({ db, auth, config }) {
   const parseCookie = (req) => (req.get('cookie') || '').split(';').map(x=>x.trim()).find(x=>x.startsWith(cookieName+'='))?.slice(cookieName.length+1) || '';
   const device = req => { const secret=parseCookie(req);return secret ? deviceByToken.get(sha(secret),Date.now()) : null; };
   const setCookie = (res, token, ageMs) => {
-    const flags = [`${cookieName}=${token}`, 'HttpOnly', 'SameSite=Strict', 'Path=/devices', `Max-Age=${Math.floor(ageMs/1000)}`];
+    const flags = [`${cookieName}=${token}`, 'HttpOnly', 'SameSite=Lax', 'Path=/devices', `Max-Age=${Math.floor(ageMs/1000)}`];
     if (config.publicUrl.startsWith('https://')) flags.push('Secure');
     res.set('Set-Cookie',flags.join('; '));
   };
   const originOkay = (req,res,next) => sameSiteRequest(req,config.publicUrl) ? next() : res.status(403).send('Origem não autorizada');
-  const requireDevice = (req,res,next) => {req.mpDevice=device(req);return req.mpDevice?next():res.status(401).set('Cache-Control','no-store').type('text').send('Aparelho não pareado ou sessão expirada. Abra /devices/activate.');};
+  // MULTIDEVICE_COOKIE_V03: migra cookies Strict antigos ao abrir uma pagina autenticada.
+  // A duracao e sempre limitada ao vencimento original no banco; nao renova o token.
+  const requireDevice = (req,res,next) => {
+    req.mpDevice = device(req);
+    if (!req.mpDevice) return res.status(401).set('Cache-Control','no-store').type('text').send('Aparelho não pareado ou sessão expirada. Abra /devices/activate.');
+    if (req.method === 'GET' && (req.path === '/me' || req.path === '/player')) {
+      const token = parseCookie(req);
+      const remainingMs = Math.max(0, req.mpDevice.expires_at - Date.now());
+      setCookie(res, token, remainingMs);
+    }
+    return next();
+  };
   router.get('/',auth.require,(req,res)=> {
     const profiles=profilesFor.all(req.session.accountId);
     const devices=devicesFor.all(req.session.accountId);
