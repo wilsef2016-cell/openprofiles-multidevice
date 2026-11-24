@@ -82,13 +82,13 @@ function guardedLookup(allowPrivate) {
   };
 }
 
-function getOnce(url, { signal, maxBytes, allowPrivate }) {
+function getOnce(url, { signal, maxBytes, allowPrivate, accept = 'application/json' }) {
   return new Promise((resolve, reject) => {
     const lib = url.protocol === 'https:' ? https : http;
     const req = lib.get(url, {
       signal,
       lookup: guardedLookup(allowPrivate),
-      headers: { accept: 'application/json', 'user-agent': 'OpenProfiles (+https://github.com/kgenovz/openprofiles)' },
+      headers: { accept, 'user-agent': 'OpenProfiles (+https://github.com/kgenovz/openprofiles)' },
     }, (res) => {
       const status = res.statusCode;
       if (status >= 300 && status < 400 && res.headers.location) {
@@ -111,7 +111,7 @@ function getOnce(url, { signal, maxBytes, allowPrivate }) {
         }
         chunks.push(chunk);
       });
-      res.on('end', () => resolve({ status, body: Buffer.concat(chunks).toString('utf8') }));
+      res.on('end', () => resolve({ status, body: Buffer.concat(chunks) }));
       res.on('error', reject);
       return undefined;
     });
@@ -143,11 +143,22 @@ export async function fetchJson(raw, { timeoutMs = FETCH_TIMEOUT_MS, maxBytes = 
     }
     if (res.status !== 200) throw new FetchError('UNREACHABLE', `The add-on answered with an error (${res.status}).`);
     try {
-      return JSON.parse(res.body);
+      return JSON.parse(res.body.toString('utf8'));
     } catch {
       throw new FetchError('NOT_JSON', "That link doesn't lead to an add-on manifest.");
     }
   }
+}
+
+/** Read a bounded image from a vetted HTTPS origin without following redirects. */
+export async function fetchImageBytes(raw, { maxBytes = FETCH_MAX_BYTES, timeoutMs = FETCH_TIMEOUT_MS } = {}) {
+  const url = checkUrl(raw);
+  if (url.protocol !== 'https:') throw new FetchError('BAD_URL', 'Images require HTTPS.');
+  const result = await getOnce(url, {
+    signal: AbortSignal.timeout(timeoutMs), maxBytes, allowPrivate: false, accept: 'image/jpeg, image/png, image/webp',
+  });
+  if (result.status !== 200) throw new FetchError('UNREACHABLE', 'Image unavailable.');
+  return result.body;
 }
 
 /** Accept the forms people paste: stremio:// links, and nothing that isn't a manifest. */
