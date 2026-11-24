@@ -1,0 +1,138 @@
+name: Corrigir ponte MultiDevice v0.4.1 - IP Railway
+
+on:
+  push:
+    branches: [multidevice-test]
+    paths: [.github/workflows/multidevice-realip-fix.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  corrigir:
+    name: Corrigir leitura do IP e validar sem alterar historicos
+    if: github.ref == 'refs/heads/multidevice-test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar branch experimental
+        uses: actions/checkout@v4
+        with:
+          ref: multidevice-test
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Preparar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Aplicar somente correcao da ponte de rede
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/web/device-network-bridge.js')
+          caller = Path('src/web/device-pairing.js')
+          assert p.exists() and caller.exists(), 'Nao foi encontrada a integracao v0.4'
+          code = p.read_text(encoding='utf-8')
+          wiring = caller.read_text(encoding='utf-8')
+          marker = 'MULTIDEVICE_REALIP_V041'
+          if marker in code:
+              print('Correcao ja presente; nao duplicar.')
+          else:
+              replacements = [
+                  (
+                      "import { NETWORK_TTL_MS, networkDigest, candidateForNetwork } from './device-bridge-core.js';",
+                      "import { NETWORK_TTL_MS, networkDigest, candidateForNetwork, publicIp } from './device-bridge-core.js';"
+                  ),
+                  (
+                      "export function createDeviceNetworkBridge({db, requireDevice, originOkay, page}) {",
+                      """// MULTIDEVICE_REALIP_V041: read client IP from Railway's sanitized public HTTPS ingress.
+          // Only a tentative network correlation; NEVER use this as authentication or device proof.
+          // Direct private-network requests can forge forwarded headers, so do not use this
+          // signal for access control or for overwriting verified per-profile progress.
+          function observedIp(req, config) {
+            const expectedHost = new URL(config.publicUrl).host;
+            const edgeHost = req.get('x-forwarded-host');
+            const edgeProto = req.get('x-forwarded-proto');
+            const realIp = req.get('x-real-ip');
+            if (req.get('host') === expectedHost && edgeHost === expectedHost &&
+                edgeProto === 'https' && publicIp(realIp)) return realIp;
+            return req.ip;
+          }
+
+          export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, config}) {"""
+                  ),
+                  (
+                      'const hash = networkDigest(secret, req.ip);',
+                      'const hash = networkDigest(secret, observedIp(req, config));'
+                  ),
+                  (
+                      'const hash = networkDigest(secret,req.ip);',
+                      'const hash = networkDigest(secret,observedIp(req, config));'
+                  )
+              ]
+              for old, new in replacements:
+                  count = code.count(old)
+                  if count != 1:
+                      raise SystemExit(f'Abortado: ancora inesperada no arquivo ponte ({count}): {old[:85]}')
+                  code = code.replace(old, new, 1)
+              p.write_text(code, encoding='utf-8')
+              print('Ponte corrigida nas duas rotas de recebimento e comparacao.')
+          old = 'networkBridge = createDeviceNetworkBridge({ db, requireDevice, originOkay, page });'
+          new = 'networkBridge = createDeviceNetworkBridge({ db, requireDevice, originOkay, page, config });'
+          if new not in wiring:
+              if wiring.count(old) != 1:
+                  raise SystemExit('Abortado: ancora para conectar configuracao nao encontrada.')
+              caller.write_text(wiring.replace(old, new, 1), encoding='utf-8')
+              print('Configuracao PUBLIC_URL conectada a ponte.')
+          else:
+              print('Configuracao ja conectada; nao duplicar.')
+          PY
+
+      - name: Verificar sintaxe
+        run: |
+          node --check src/web/device-network-bridge.js
+          node --check src/web/device-pairing.js
+          node --check src/web/device-bridge-core.js
+
+      - name: Verificar alteracoes restritas
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          python3 - <<'PY'
+          import subprocess
+          changed=set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())
+          allowed={'src/web/device-network-bridge.js','src/web/device-pairing.js'}
+          assert changed <= allowed, f'Modificacoes inesperadas: {changed-allowed}'
+          bridge=open('src/web/device-network-bridge.js',encoding='utf-8').read()
+          assert bridge.count('networkDigest(secret, observedIp(req, config))') == 1
+          assert bridge.count('networkDigest(secret,observedIp(req, config))') == 1
+          assert 'return req.ip;' in bridge
+          print('Alteracoes limitadas aos dois arquivos previstos; sem migracoes de banco.')
+          PY
+
+      - name: Instalar dependencias e executar testes
+        run: |
+          npm ci
+          npm test
+
+      - name: Salvar correcao somente em multidevice-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = multidevice-test
+          git add src/web/device-network-bridge.js src/web/device-pairing.js
+          if git diff --cached --quiet; then
+            echo 'Nenhuma nova alteracao.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Fix MultiDevice bridge public client IP detection on Railway [test]'
+          git pull --rebase origin multidevice-test
+          git push origin HEAD:multidevice-test
