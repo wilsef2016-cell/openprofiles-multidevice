@@ -86,10 +86,23 @@ export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, 
 
   // Catalog reads use only the connection address or Express's address-based
   // proxy chain. The legacy X-Real-IP hint is useful for diagnostics only.
-  function matchCatalogNetwork(req, accountId, now = Date.now()) {
+  function catalogIp(req) {
     const trust = config.trustProxy;
-    const ip = trust === true || typeof trust === 'number' ? req.socket.remoteAddress : req.ip;
-    return matchNetwork(accountId, ip, now);
+    return trust === true || typeof trust === 'number' ? req.socket.remoteAddress : req.ip;
+  }
+
+  function matchCatalogNetwork(req, accountId, now = Date.now()) {
+    return matchNetwork(accountId, catalogIp(req), now);
+  }
+
+  function bindCatalogNetwork(req, device, now = Date.now()) {
+    const hash = networkDigest(secret, catalogIp(req));
+    if (!hash) return false;
+    const existing = getBinding.get(device.id);
+    // Keep an existing active association so legacy consent stays valid.
+    if (existing?.expires_at > now && existing.account_id === device.account_id && existing.ip_hash === hash) return true;
+    bind(device, hash, now);
+    return true;
   }
 
   function suggest({req,accountId,eventId,now=Date.now()}) {
@@ -133,5 +146,5 @@ export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, 
     unbind(req.mpDevice.id);
     res.redirect(303,'/devices/bridge');
   });
-  return {router,suggest,matchCatalogNetwork};
+  return {router,suggest,matchCatalogNetwork,bindCatalogNetwork};
 }

@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import sharp from 'sharp';
+import { AccountsService } from '../src/core/accounts.js';
+import { Settings } from '../src/core/settings.js';
+import { openDatabase } from '../src/db.js';
 import { sha } from '../src/web/device-core.js';
 import { silentLogger } from '../src/log.js';
 import { createApp } from '../src/web/app.js';
@@ -100,7 +106,7 @@ async function fixture(t, { trustProxy = false, onMetadata } = {}) {
     assert.equal(res.headers.get('access-control-allow-origin'), '*');
     return (await res.json()).metas;
   }
-  return { ...ctx, repo, original, kids, config, metadataRequests, posterRequests, owner, base, add, authorize, metas, pair };
+  return { ...ctx, repo, original, kids, config, historyCatalogUpstream, metadataRequests, posterRequests, owner, base, add, authorize, metas, pair };
 }
 
 test('catalog reads independent progress for two profiles using a catalog-only manifest and canonical IDs', async (t) => {
@@ -265,6 +271,7 @@ test('an account cannot authorize or revoke another profile or read outside its 
 });
 
 const DYNAMIC = '/devices/dynamic-catalog';
+const UNIFIED = '/devices/unified-catalog';
 const NETWORK_A = '1.1.1.1';
 const NETWORK_B = '8.8.8.8';
 const PROXY = '9.9.9.9';
@@ -286,20 +293,21 @@ async function bind(browser, ip) {
   assert.equal((await postFrom(browser, '/devices/bridge/enable', ip, { consent: 'yes' })).location, '/devices/bridge');
 }
 
-async function allowDevice(browser, ip) {
-  assert.equal((await postFrom(browser, `${DYNAMIC}/authorize-device`, ip, { consent: 'yes' })).location, DYNAMIC);
+async function allowDevice(browser, ip, page = DYNAMIC) {
+  assert.equal((await postFrom(browser, `${page}/authorize-device`, ip, { consent: 'yes' })).location, page);
 }
 
-async function allowProfile(browser, profile) {
-  assert.equal((await browser.post(`${DYNAMIC}/authorize-profile`, { profileId: profile.id, consent: 'yes' })).location, DYNAMIC);
+async function allowProfile(browser, profile, page = DYNAMIC) {
+  assert.equal((await browser.post(`${page}/authorize-profile`, { profileId: profile.id, consent: 'yes' })).location, page);
 }
 
-async function dynamicLink(browser) {
-  const issued = await browser.post(`${DYNAMIC}/create-link`, { consent: 'yes' });
+async function dynamicLink(browser, page = DYNAMIC) {
+  const issued = await browser.post(`${page}/create-link`, { consent: 'yes' });
   assert.equal(issued.status, 200);
   assert.equal(issued.headers.get('cache-control'), 'no-store');
-  const token = issued.text.match(/\/devices\/dynamic-catalog\/addon\/([a-zA-Z0-9_-]{43})\/manifest\.json/)[1];
-  return `${browser.base}${DYNAMIC}/addon/${token}`;
+  const manifest = issued.text.match(/(\/devices\/[a-z-]+\/addon\/[a-zA-Z0-9_-]{43})\/manifest\.json/)[1];
+  assert.ok(manifest.startsWith(`${page}/addon/`));
+  return `${browser.base}${manifest}`;
 }
 
 const dynamicPath = (url, type = 'movie') => `${url}/catalog/${type}/my-profile-${type === 'movie' ? 'movies' : 'series'}.json`;
@@ -511,4 +519,275 @@ test('a profile change while artwork is loading discards the previous catalog re
     release.resolve();
   }
   assert.deepEqual(await oldRequest, []);
+});
+
+async function manifestAt(url) {
+  const response = await fetch(url + '/manifest.json');
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'private, no-store, max-age=0');
+  return response.json();
+}
+
+const fixedPath = (url, { type, id }) => [url, 'catalog', type, id].join('/') + '.json';
+const fixedCatalog = (manifest, profile, type = 'movie') => manifest.catalogs.find(c =>
+  c.type === type && c.name === 'OpenProfiles — ' + profile.name + (type === 'movie' ? ' — Filmes' : ' — Séries'));
+
+async function catalogItems(path, ip, extraHeaders) {
+  const response = await requestFrom(path, ip, extraHeaders);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('vary'), '*');
+  assert.equal(response.headers.get('etag'), null);
+  return (await response.json()).metas;
+}
+
+test('the unified manifest keeps fixed consent separate and resolves two paired browsers on distinct networks', async (t) => {
+  const { base, db, fake, owner, otherDevice, original, kids, add } = await dynamicFixture(t);
+  add(original, MATRIX, 193000);
+  add(original, THRONES + ':2:1', 12000, { type: 'series' });
+  add(original, THRONES + ':2:3', 43000, { type: 'series' });
+  add(kids, kidsOnlyMovie, 84000);
+  const stremioCalls = fake.calls.length;
+  const anonymous = new Browser(base);
+  assert.equal((await anonymous.request(UNIFIED)).location, '/signin');
+  const settingsPage = await owner.request(UNIFIED);
+  assert.match(settingsPage.text, /Usar neste aparelho/);
+  assert.match(settingsPage.text, /outros aparelhos da mesma conta Stremio/);
+  assert.equal((await owner.request(UNIFIED + '/authorize-fixed', { method: 'POST', form: { profileId: original.id, consent: 'yes' } })).status, 403);
+  assert.equal((await owner.post(UNIFIED + '/authorize-fixed', { profileId: original.id })).status, 400);
+  assert.equal((await owner.post(UNIFIED + '/authorize-fixed', { profileId: '1e0', consent: 'yes' })).status, 400);
+  const url = await dynamicLink(owner, UNIFIED);
+  const initial = await manifestAt(url);
+  assert.equal(initial.name, 'OpenProfiles MultiDevice');
+  assert.equal(initial.version, '0.9.0');
+  assert.deepEqual(initial.resources, ['catalog']);
+  assert.deepEqual(initial.catalogs.map(c => c.name), ['Meu perfil — Filmes', 'Meu perfil — Séries']);
+
+  await allowProfile(owner, original, UNIFIED);
+  await allowDevice(owner, NETWORK_A, UNIFIED);
+  await allowDevice(otherDevice, NETWORK_B, UNIFIED);
+  assert.equal((await owner.post(UNIFIED + '/authorize-fixed', { profileId: kids.id, consent: 'yes' })).location, UNIFIED);
+  const authorized = await manifestAt(url);
+  assert.equal(authorized.id, initial.id);
+  assert.equal(fixedCatalog(authorized, original), undefined);
+  const kidsRow = fixedCatalog(authorized, kids);
+  assert.deepEqual((await catalogItems(fixedPath(url, kidsRow))).map(m => m.id), [kidsOnlyMovie]);
+  assert.deepEqual(await dynamicMovies(url, NETWORK_B), [], 'fixed consent gives no automatic permission');
+  assert.deepEqual(await dynamicMovies(url), [], 'missing identification never falls back');
+  assert.deepEqual(await dynamicMovies(url, PROXY), []);
+
+  await allowProfile(owner, kids, UNIFIED);
+  const moviesPath = dynamicPath(url);
+  const [fromA, fromB] = await Promise.all([
+    catalogItems(moviesPath, NETWORK_A, { 'if-none-match': '*' }),
+    catalogItems(moviesPath, NETWORK_B),
+  ]);
+  assert.deepEqual(fromA.map(m => m.id), [MATRIX]);
+  assert.deepEqual(fromB.map(m => m.id), [kidsOnlyMovie]);
+  assert.match(fromA[0].name, /The Matrix · 3:13/);
+  assert.equal((await requestFrom(base + new URL(fromA[0].poster).pathname, NETWORK_B)).status, 404);
+  assert.equal((await requestFrom(base + new URL(fromA[0].poster).pathname, NETWORK_A)).status, 200);
+  const series = await catalogItems(dynamicPath(url, 'series'), NETWORK_A);
+  assert.deepEqual(series.map(m => m.id), [THRONES]);
+  assert.match(series[0].name, /Game of Thrones · T2E3/);
+  assert.equal((await fetch(url + '/stream/movie/' + MATRIX + '.json')).status, 404);
+  assert.equal((await owner.post(UNIFIED + '/authorize-fixed', { profileId: original.id, consent: 'yes' })).location, UNIFIED);
+  const bothFixed = await manifestAt(url);
+  const fixedSeries = await catalogItems(fixedPath(url, fixedCatalog(bothFixed, original, 'series')), NETWORK_B);
+  assert.deepEqual(fixedSeries.map(m => m.id), [THRONES]);
+  assert.equal(fixedSeries[0].name, series[0].name);
+  assert.deepEqual((await catalogItems(fixedPath(url, fixedCatalog(bothFixed, original)), NETWORK_B)).map(m => m.id), [MATRIX]);
+  assert.equal(fixedCatalog(bothFixed, kids).id, kidsRow.id);
+
+  assert.equal((await owner.post(UNIFIED + '/select-profile', { profileId: kids.id })).location, UNIFIED);
+  assert.deepEqual((await dynamicMovies(url, NETWORK_A)).map(m => m.id), [kidsOnlyMovie]);
+  assert.equal((await owner.post(UNIFIED + '/select-profile', { profileId: original.id })).location, UNIFIED);
+  assert.deepEqual((await dynamicMovies(url, NETWORK_A)).map(m => m.id), [MATRIX]);
+
+  assert.equal((await postFrom(otherDevice, UNIFIED + '/bind-device', NETWORK_A, {})).status, 400);
+  assert.equal((await postFrom(otherDevice, UNIFIED + '/bind-device', NETWORK_A, { consent: 'yes' })).location, UNIFIED);
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+  assert.equal((await postFrom(otherDevice, UNIFIED + '/authorize-device', NETWORK_A, { consent: 'yes' })).status, 409);
+  assert.deepEqual((await catalogItems(fixedPath(url, kidsRow), NETWORK_A)).map(m => m.id), [kidsOnlyMovie]);
+  db.prepare('UPDATE mp_bridge_bindings SET expires_at=0 WHERE device_id=(SELECT id FROM mp_devices WHERE label=?)').run('Quarto');
+  assert.deepEqual((await dynamicMovies(url, NETWORK_A)).map(m => m.id), [MATRIX]);
+  db.prepare('UPDATE mp_bridge_bindings SET expires_at=0 WHERE device_id=(SELECT id FROM mp_devices WHERE label=?)').run('Sala');
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+  assert.equal(fake.calls.length, stremioCalls);
+});
+
+test('unified revocation invalidates old fixed descriptors and covers independently of automatic consent', async (t) => {
+  const { base, service, owner, original, add } = await dynamicFixture(t);
+  add(original, MATRIX, 193000);
+  await allowProfile(owner, original, UNIFIED);
+  await allowDevice(owner, NETWORK_A, UNIFIED);
+  await owner.post(UNIFIED + '/authorize-fixed', { profileId: original.id, consent: 'yes' });
+  const url = await dynamicLink(owner, UNIFIED);
+  const manifest = await manifestAt(url);
+  const row = fixedCatalog(manifest, original);
+  const path = fixedPath(url, row);
+  const poster = base + new URL((await catalogItems(path))[0].poster).pathname;
+  assert.equal((await fetch(poster, { headers: { 'if-none-match': '*' } })).status, 200);
+  assert.equal((await owner.post(UNIFIED + '/revoke-fixed', { profileId: original.id })).location, UNIFIED);
+  assert.equal(fixedCatalog(await manifestAt(url), original), undefined);
+  assert.deepEqual(await catalogItems(path), []);
+  assert.equal((await fetch(poster)).status, 404);
+  assert.deepEqual((await dynamicMovies(url, NETWORK_A)).map(m => m.id), [MATRIX]);
+
+  await owner.post(UNIFIED + '/authorize-fixed', { profileId: original.id, consent: 'yes' });
+  const newRow = fixedCatalog(await manifestAt(url), original);
+  assert.notEqual(newRow.id, row.id);
+  assert.deepEqual(await catalogItems(path), []);
+  assert.equal((await owner.post(UNIFIED + '/revoke-profile', { profileId: original.id })).location, UNIFIED);
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+  assert.deepEqual((await catalogItems(fixedPath(url, newRow))).map(m => m.id), [MATRIX]);
+  await allowProfile(owner, original, UNIFIED);
+  assert.equal((await owner.post(UNIFIED + '/revoke-device')).location, UNIFIED);
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+  await allowDevice(owner, NETWORK_A, UNIFIED);
+
+  const replacement = await dynamicLink(owner, UNIFIED);
+  assert.notEqual(replacement, url);
+  assert.equal((await manifestAt(replacement)).id, manifest.id);
+  assert.equal((await fetch(url + '/manifest.json')).status, 404);
+  assert.equal((await fetch(poster)).status, 404);
+  assert.deepEqual((await dynamicMovies(replacement, NETWORK_A)).map(m => m.id), [MATRIX]);
+  assert.deepEqual((await catalogItems(fixedPath(replacement, newRow))).map(m => m.id), [MATRIX]);
+
+  await service.setPasscode(original.id, { code: '1234' });
+  assert.equal(fixedCatalog(await manifestAt(replacement), original), undefined);
+  assert.deepEqual(await catalogItems(fixedPath(replacement, newRow)), []);
+  assert.deepEqual(await dynamicMovies(replacement, NETWORK_A), []);
+  assert.equal((await owner.post(UNIFIED + '/revoke-link')).location, UNIFIED);
+  assert.equal((await fetch(replacement + '/manifest.json')).status, 404);
+  assert.equal((await fetch(fixedPath(replacement, newRow))).status, 404);
+});
+
+test('tokens for a second account on the same IP cannot read or authorize another account’s unified catalog', async (t) => {
+  const { base, accounts, fake, owner, original, add, pair } = await dynamicFixture(t);
+  add(original, MATRIX, 193000);
+  await owner.post(UNIFIED + '/authorize-fixed', { profileId: original.id, consent: 'yes' });
+  await allowProfile(owner, original, UNIFIED);
+  await allowDevice(owner, NETWORK_A, UNIFIED);
+  const ownerLink = await dynamicLink(owner, UNIFIED);
+  const ownerRow = fixedCatalog(await manifestAt(ownerLink), original);
+  const visitor = new Browser(base);
+  const firstUser = fake.user;
+  fake.user = { _id: 'other-user', email: 'other@example.com' };
+  try {
+    const login = await visitor.request('/signin', { method: 'POST', form: { email: fake.user.email, password: fake.password } });
+    assert.equal(login.location, '/configure');
+  } finally {
+    fake.user = firstUser;
+  }
+  const other = accounts.forAccount(2).repo.listProfiles()[0];
+  await pair(visitor, other, 'Outro lar');
+  await bind(visitor, NETWORK_A);
+  add(other, kidsOnlyMovie, 84000);
+  assert.equal((await visitor.post(UNIFIED + '/authorize-fixed', { profileId: original.id, consent: 'yes' })).status, 404);
+  assert.equal((await visitor.post(UNIFIED + '/revoke-fixed', { profileId: original.id })).status, 404);
+  await visitor.post(UNIFIED + '/authorize-fixed', { profileId: other.id, consent: 'yes' });
+  await allowProfile(visitor, other, UNIFIED);
+  await allowDevice(visitor, NETWORK_A, UNIFIED);
+  const visitorLink = await dynamicLink(visitor, UNIFIED);
+  const visitorManifest = await manifestAt(visitorLink);
+  const visitorRow = fixedCatalog(visitorManifest, other);
+  assert.notEqual(visitorManifest.id, (await manifestAt(ownerLink)).id);
+  assert.deepEqual(await catalogItems(fixedPath(visitorLink, ownerRow), NETWORK_A), []);
+  assert.deepEqual(await catalogItems(fixedPath(ownerLink, visitorRow), NETWORK_A), []);
+  assert.deepEqual((await catalogItems(fixedPath(visitorLink, visitorRow), NETWORK_A)).map(m => m.id), [kidsOnlyMovie]);
+  assert.deepEqual((await dynamicMovies(visitorLink, NETWORK_A)).map(m => m.id), [kidsOnlyMovie]);
+  assert.deepEqual((await dynamicMovies(ownerLink, NETWORK_A)).map(m => m.id), [MATRIX]);
+  assert.deepEqual((await catalogItems(fixedPath(ownerLink, ownerRow), NETWORK_A)).map(m => m.id), [MATRIX]);
+});
+
+test('opening a v0.8 database preserves legacy rows and links without copying their consent to v0.9', async (t) => {
+  const ctx = await dynamicFixture(t);
+  const { db, config, owner, original, historyCatalogUpstream, add, authorize } = ctx;
+  add(original, MATRIX, 193000);
+  db.prepare(`INSERT INTO mp_progress
+    (account_id,profile_id,video_id,media_id,type,title,current_ms,duration_ms,action,device_id,updated_at)
+    SELECT account_id,profile_id,?,?,'movie','The Matrix',193000,7200000,'pause',id,created_at
+    FROM mp_devices WHERE label='Sala'`).run(MATRIX, MATRIX);
+  const oldFixed = await authorize(owner, original);
+  await allowProfile(owner, original);
+  await allowDevice(owner, NETWORK_A);
+  const oldDynamic = await dynamicLink(owner);
+  const legacyTables = [
+    'accounts', 'profiles', 'mp_devices', 'mp_progress', 'mp_native_history_events', 'mp_bridge_bindings',
+    'mp_history_catalog_grants', 'mp_dynamic_catalog_installs', 'mp_dynamic_catalog_profiles', 'mp_dynamic_catalog_devices',
+  ];
+  const unifiedTables = ['installs', 'profiles', 'devices', 'fixed_profiles'].map(suffix => 'mp_unified_catalog_' + suffix);
+  const snapshot = database => legacyTables.map(table => database.prepare('SELECT * FROM ' + table + ' ORDER BY rowid').all());
+  const before = snapshot(db);
+  const directory = await mkdtemp(join(tmpdir(), 'openprofiles-v08-'));
+  let restored;
+  let server;
+  t.after(async () => {
+    if (server) await new Promise(resolve => server.close(resolve));
+    restored?.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+  await db.backup(join(directory, 'openprofiles.db'));
+  // Build a pre-upgrade fixture on the temporary copy by removing only the
+  // new, empty tables. Legacy state was written via the original endpoints.
+  const saved = openDatabase(directory);
+  try {
+    for (const table of unifiedTables) {
+      assert.deepEqual(saved.prepare('SELECT * FROM ' + table).all(), []);
+      saved.exec('DROP TABLE ' + table);
+    }
+  } finally {
+    saved.close();
+  }
+
+  restored = openDatabase(directory);
+  const settings = new Settings({ db: restored, env: { ACCESS: 'open' } });
+  const accounts = new AccountsService({
+    db: restored, cipher: ctx.cipher, stremio: ctx.stremio, access: () => settings.access(), fetchManifest: ctx.web.fetchManifest,
+  });
+  const app = createApp({ config, db: restored, accounts, settings, log: silentLogger, historyCatalogUpstream });
+  server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  assert.deepEqual(snapshot(restored), before);
+  for (const table of unifiedTables) assert.deepEqual(restored.prepare('SELECT * FROM ' + table).all(), []);
+  const base = 'http://127.0.0.1:' + server.address().port;
+  const browser = new Browser(base);
+  browser.jar = new Map(owner.jar);
+  const legacyFixed = base + new URL(oldFixed.url).pathname;
+  const legacyDynamic = base + new URL(oldDynamic).pathname;
+  const url = await dynamicLink(browser, UNIFIED);
+  assert.deepEqual((await manifestAt(url)).catalogs.map(c => c.name), ['Meu perfil — Filmes', 'Meu perfil — Séries']);
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+  assert.equal((await postFrom(browser, UNIFIED + '/bind-device', NETWORK_A, { consent: 'yes' })).location, UNIFIED);
+  assert.deepEqual(snapshot(restored), before, 'reusing an active binding preserves the old grant');
+  assert.equal((await fetch(legacyFixed + '/manifest.json')).status, 200);
+  assert.deepEqual((await ctx.metas(legacyFixed)).map(m => m.id), [MATRIX]);
+  assert.deepEqual((await dynamicMovies(legacyDynamic, NETWORK_A)).map(m => m.id), [MATRIX]);
+  assert.equal((await browser.post(UNIFIED + '/revoke-link')).location, UNIFIED);
+  assert.deepEqual((await ctx.metas(legacyFixed)).map(m => m.id), [MATRIX]);
+  assert.deepEqual((await dynamicMovies(legacyDynamic, NETWORK_A)).map(m => m.id), [MATRIX]);
+  assert.deepEqual(snapshot(restored), before);
+});
+
+test('revoking a fixed grant during metadata loading discards the pending response', { timeout: 10_000 }, async (t) => {
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const { owner, original, add } = await dynamicFixture(t, {
+    async onMetadata() {
+      started.resolve();
+      await release.promise;
+    },
+  });
+  add(original, MATRIX, 193000);
+  await owner.post(UNIFIED + '/authorize-fixed', { profileId: original.id, consent: 'yes' });
+  const url = await dynamicLink(owner, UNIFIED);
+  const row = fixedCatalog(await manifestAt(url), original);
+  const pending = catalogItems(fixedPath(url, row));
+  try {
+    await Promise.race([started.promise, pending.then(() => { throw new Error('Catalog returned before fetching metadata'); })]);
+    assert.equal((await owner.post(UNIFIED + '/revoke-fixed', { profileId: original.id })).location, UNIFIED);
+  } finally {
+    release.resolve();
+  }
+  assert.deepEqual(await pending, []);
 });

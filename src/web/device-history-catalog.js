@@ -67,7 +67,7 @@ export function createDeviceHistoryCatalog({ db, auth, originOkay, page, config,
         <form method="post" action="${PATH}/revoke">${csrf(req)}
           <input type="hidden" name="profileId" value="${g.profile_id}"><button type="submit">Revogar link</button>
         </form></li>`).join('')}</ul>` : '<p>Nenhum link ativo.</p>'}
-      <p><a href="/devices/native-history">Voltar ao histórico experimental</a> · <a href="/devices/dynamic-catalog">Configurar Meu perfil</a></p>`);
+      <p><a href="/devices/native-history">Voltar ao histórico experimental</a> · <a href="/devices/dynamic-catalog">Configurar Meu perfil</a> · <a href="/devices/unified-catalog">Add-on unificado</a></p>`);
   }
 
   const authorize = db.transaction((accountId, profileId) => {
