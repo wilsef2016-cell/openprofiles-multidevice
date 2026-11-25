@@ -19,7 +19,7 @@ const kidsOnlyMovie = 'tt0110357';
 const imdbPoster = id => `https://images.metahub.space/poster/small/${id}/img`;
 const catalogPath = (url, type = 'movie') => `${url}/catalog/${type}/history-${type === 'movie' ? 'movies' : 'series'}.json`;
 
-async function fixture(t) {
+async function fixture(t, { trustProxy = false, onMetadata } = {}) {
   const previous = process.env.MULTIDEVICE_MODE;
   process.env.MULTIDEVICE_MODE = 'true';
   t.after(() => {
@@ -34,6 +34,7 @@ async function fixture(t) {
   const historyCatalogUpstream = {
     async fetchMetadata(url) {
       metadataRequests.push(url);
+      if (onMetadata) await onMetadata(url);
       const [, , type, end] = new URL(url).pathname.split('/');
       const id = end.replace(/\.json$/, '');
       if (id === missingMeta) throw new Error('Cinemeta temporarily unavailable');
@@ -49,7 +50,7 @@ async function fixture(t) {
       return cover;
     },
   };
-  const config = { publicUrl: 'https://profiles.example.com', trustProxy: false };
+  const config = { publicUrl: 'https://profiles.example.com', trustProxy };
   const app = createApp({ config, db, accounts, settings, log: silentLogger, historyCatalogUpstream });
   const server = app.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -65,6 +66,14 @@ async function fixture(t) {
     VALUES (@id,@accountId,@deviceId,@profileId,'fixture',@id,@type,@videoId,'stop',@position,@duration,@id,@undoneAt)`);
   const devices = new Map();
   let eventId = 0;
+
+  async function pair(browser, profile, label) {
+    const pairing = await browser.post('/devices/new-pair', { profileId: profile.id, label });
+    assert.equal(pairing.status, 200);
+    const code = pairing.text.match(/<h2><code>([A-Z0-9]+)<\/code><\/h2>/)[1];
+    assert.equal((await browser.request('/devices/activate', { method: 'POST', form: { code } })).location, '/devices/me');
+    devices.set(profile.id, db.prepare('SELECT id FROM mp_devices WHERE label=?').pluck().get(label));
+  }
 
   function add(profile, videoId, position, { type = 'movie', duration = 7_200_000, undoneAt = null } = {}) {
     const accountId = db.prepare('SELECT account_id FROM profiles WHERE id=?').pluck().get(profile.id);
@@ -91,7 +100,7 @@ async function fixture(t) {
     assert.equal(res.headers.get('access-control-allow-origin'), '*');
     return (await res.json()).metas;
   }
-  return { ...ctx, repo, original, kids, config, metadataRequests, posterRequests, owner, base, add, authorize, metas };
+  return { ...ctx, repo, original, kids, config, metadataRequests, posterRequests, owner, base, add, authorize, metas, pair };
 }
 
 test('catalog reads independent progress for two profiles using a catalog-only manifest and canonical IDs', async (t) => {
@@ -253,4 +262,253 @@ test('an account cannot authorize or revoke another profile or read outside its 
   assert.equal((await fetch(`${ownerLink.url}/manifest.json`)).status, 404);
   assert.equal((await owner.post(`${PAGE}/authorize`, { profileId: original.id, consent: 'yes' })).status, 404);
   assert.equal((await owner.post(`${PAGE}/revoke`, { profileId: original.id })).status, 303);
+});
+
+const DYNAMIC = '/devices/dynamic-catalog';
+const NETWORK_A = '1.1.1.1';
+const NETWORK_B = '8.8.8.8';
+const PROXY = '9.9.9.9';
+
+function requestFrom(url, ip, extraHeaders = {}) {
+  return fetch(url, { headers: { ...(ip && { 'x-forwarded-for': ip }), ...extraHeaders } });
+}
+
+async function postFrom(browser, path, ip, fields) {
+  const response = await fetch(browser.base + path, {
+    method: 'POST', redirect: 'manual',
+    headers: { cookie: browser.cookie, 'x-forwarded-for': ip, 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ _csrf: await browser.csrf(), ...fields }),
+  });
+  return { status: response.status, location: response.headers.get('location'), text: await response.text() };
+}
+
+async function bind(browser, ip) {
+  assert.equal((await postFrom(browser, '/devices/bridge/enable', ip, { consent: 'yes' })).location, '/devices/bridge');
+}
+
+async function allowDevice(browser, ip) {
+  assert.equal((await postFrom(browser, `${DYNAMIC}/authorize-device`, ip, { consent: 'yes' })).location, DYNAMIC);
+}
+
+async function allowProfile(browser, profile) {
+  assert.equal((await browser.post(`${DYNAMIC}/authorize-profile`, { profileId: profile.id, consent: 'yes' })).location, DYNAMIC);
+}
+
+async function dynamicLink(browser) {
+  const issued = await browser.post(`${DYNAMIC}/create-link`, { consent: 'yes' });
+  assert.equal(issued.status, 200);
+  assert.equal(issued.headers.get('cache-control'), 'no-store');
+  const token = issued.text.match(/\/devices\/dynamic-catalog\/addon\/([a-zA-Z0-9_-]{43})\/manifest\.json/)[1];
+  return `${browser.base}${DYNAMIC}/addon/${token}`;
+}
+
+const dynamicPath = (url, type = 'movie') => `${url}/catalog/${type}/my-profile-${type === 'movie' ? 'movies' : 'series'}.json`;
+
+async function dynamicMovies(url, ip) {
+  const response = await requestFrom(dynamicPath(url), ip);
+  assert.equal(response.status, 200);
+  return (await response.json()).metas;
+}
+
+async function dynamicFixture(t, options = {}) {
+  // Simulate a reverse proxy trusted by address, not a trust-all deployment.
+  const ctx = await fixture(t, { trustProxy: 'loopback', ...options });
+  const otherDevice = new Browser(ctx.base);
+  assert.equal((await otherDevice.signIn()).location, '/configure');
+  await ctx.pair(ctx.owner, ctx.original, 'Sala');
+  await ctx.pair(otherDevice, ctx.kids, 'Quarto');
+  await bind(ctx.owner, NETWORK_A);
+  await bind(otherDevice, NETWORK_B);
+  return { ...ctx, otherDevice };
+}
+
+test('one dynamic link serves two separately authorized profiles on distinct networks without HTTP cache reuse', async (t) => {
+  const { base, db, fake, owner, otherDevice, original, kids, add } = await dynamicFixture(t);
+  add(original, MATRIX, 193000);
+  add(kids, MATRIX, 12000);
+  add(kids, kidsOnlyMovie, 66000);
+  add(original, `${THRONES}:1:1`, 300000, { type: 'series' });
+  add(original, `${THRONES}:2:3`, 4000, { type: 'series' });
+  const historyBefore = db.prepare('SELECT * FROM mp_native_history_events ORDER BY source_event_id').all();
+  const stremioCalls = fake.calls.length;
+
+  assert.equal((await new Browser(base).request(DYNAMIC)).location, '/signin');
+  assert.equal((await owner.post(`${DYNAMIC}/create-link`)).status, 400);
+  const url = await dynamicLink(owner);
+  const install = await requestFrom(`${url}/manifest.json`, PROXY).then(r => r.json());
+  assert.equal(install.name, 'OpenProfiles — Meu perfil');
+  assert.deepEqual(install.resources, ['catalog']);
+  assert.deepEqual(install.catalogs.map(c => c.name), ['Meu perfil — Filmes', 'Meu perfil — Séries']);
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+  await allowProfile(owner, original);
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+  assert.equal((await postFrom(owner, `${DYNAMIC}/authorize-device`, NETWORK_B, { consent: 'yes' })).status, 409);
+  assert.equal((await postFrom(owner, `${DYNAMIC}/authorize-device`, NETWORK_A, {})).status, 400);
+  await allowDevice(owner, NETWORK_A);
+
+  const a = await requestFrom(dynamicPath(url), NETWORK_A);
+  const aMovies = (await a.json()).metas;
+  assert.deepEqual(aMovies.map(m => m.id), [MATRIX]);
+  assert.equal(aMovies[0].name, 'The Matrix · 3:13 / 2:00:00');
+  assert.deepEqual(await dynamicMovies(url, NETWORK_B), []);
+  await allowProfile(owner, kids);
+  await allowDevice(otherDevice, NETWORK_B);
+
+  const b = await requestFrom(dynamicPath(url), NETWORK_B, { 'if-none-match': '*' });
+  assert.equal(b.status, 200);
+  assert.equal(b.headers.get('cache-control'), 'private, no-store, max-age=0');
+  assert.equal(b.headers.get('cdn-cache-control'), 'no-store');
+  assert.equal(b.headers.get('vary'), '*');
+  assert.equal(b.headers.get('etag'), null);
+  const bMovies = (await b.json()).metas;
+  assert.deepEqual(bMovies.map(m => m.id), [kidsOnlyMovie, MATRIX]);
+  assert.equal(bMovies[1].name, 'The Matrix · 0:12 / 2:00:00');
+  assert.notEqual(aMovies[0].poster, bMovies[1].poster);
+  const posterA = base + new URL(aMovies[0].poster).pathname;
+  assert.equal((await requestFrom(posterA, NETWORK_B)).status, 404);
+  const cover = await requestFrom(posterA, NETWORK_A, { 'if-none-match': '*' });
+  assert.equal(cover.status, 200);
+  assert.equal(cover.headers.get('content-type'), 'image/jpeg');
+  assert.equal(cover.headers.get('etag'), null);
+  await cover.arrayBuffer();
+
+  const aSeries = await requestFrom(dynamicPath(url, 'series'), NETWORK_A).then(r => r.json());
+  assert.deepEqual(aSeries.metas.map(m => m.id), [THRONES]);
+  assert.match(aSeries.metas[0].name, /Game of Thrones · T2E3/);
+  assert.deepEqual(await requestFrom(dynamicPath(url, 'series'), NETWORK_B).then(r => r.json()), { metas: [] });
+  assert.equal((await requestFrom(`${url}/stream/movie/${MATRIX}.json`, NETWORK_A)).status, 404);
+  assert.deepEqual(db.prepare('SELECT * FROM mp_native_history_events ORDER BY source_event_id').all(), historyBefore);
+  assert.equal(fake.calls.length, stremioCalls);
+});
+
+test('the dynamic catalog is empty with ambiguous, expired, missing or mismatched network associations', async (t) => {
+  const { db, config, owner, otherDevice, original, add } = await dynamicFixture(t);
+  add(original, MATRIX, 193000);
+  await allowProfile(owner, original);
+  await allowDevice(owner, NETWORK_A);
+  const url = await dynamicLink(owner);
+  assert.equal((await dynamicMovies(url, NETWORK_A)).length, 1);
+  assert.deepEqual(await dynamicMovies(url), []);
+  assert.deepEqual(await dynamicMovies(url, PROXY), []);
+  const legacyHint = await requestFrom(dynamicPath(url), undefined, {
+    host: new URL(config.publicUrl).host,
+    'x-forwarded-host': new URL(config.publicUrl).host,
+    'x-forwarded-proto': 'https',
+    'x-real-ip': NETWORK_A,
+  });
+  assert.deepEqual(await legacyHint.json(), { metas: [] });
+
+  // A second binding makes the IP ambiguous even without device consent.
+  await bind(otherDevice, NETWORK_A);
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+  assert.equal((await postFrom(otherDevice, `${DYNAMIC}/authorize-device`, NETWORK_A, { consent: 'yes' })).status, 409);
+  await bind(otherDevice, NETWORK_B);
+  assert.equal((await dynamicMovies(url, NETWORK_A)).length, 1);
+
+  db.prepare('UPDATE mp_bridge_bindings SET expires_at=0 WHERE device_id=(SELECT id FROM mp_devices WHERE label=?)').run('Sala');
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+  await bind(owner, NETWORK_A);
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), [], 'a renewed binding requires fresh device consent');
+  await allowDevice(owner, NETWORK_A);
+  assert.equal((await dynamicMovies(url, NETWORK_A)).length, 1);
+
+  db.prepare('UPDATE mp_devices SET expires_at=0 WHERE label=?').run('Sala');
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+});
+
+test('dynamic reads follow a profile change and respect profile, device and link revocations while v0.7 stays available', async (t) => {
+  const { base, service, owner, original, kids, add, authorize, metas } = await dynamicFixture(t);
+  add(original, MATRIX, 18000);
+  add(kids, kidsOnlyMovie, 84000);
+  const fixed = await authorize(owner, original);
+  const url = await dynamicLink(owner);
+  assert.equal((await requestFrom(`${fixed.url.replace(PAGE, DYNAMIC)}/manifest.json`, NETWORK_A)).status, 404);
+  await allowProfile(owner, original);
+  await allowDevice(owner, NETWORK_A);
+
+  const originalPoster = (await dynamicMovies(url, NETWORK_A))[0].poster;
+  assert.equal((await owner.post('/devices/select-profile', { profileId: kids.id })).location, '/configure');
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+  await allowProfile(owner, kids);
+  assert.deepEqual((await dynamicMovies(url, NETWORK_A)).map(m => m.id), [kidsOnlyMovie]);
+  assert.equal((await requestFrom(base + new URL(originalPoster).pathname, NETWORK_A)).status, 404);
+  assert.equal((await owner.post(`${DYNAMIC}/revoke-profile`, { profileId: kids.id })).location, DYNAMIC);
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+
+  await allowProfile(owner, kids);
+  assert.equal((await owner.post(`${DYNAMIC}/revoke-device`)).location, DYNAMIC);
+  assert.deepEqual(await dynamicMovies(url, NETWORK_A), []);
+  await allowDevice(owner, NETWORK_A);
+  const replacement = await dynamicLink(owner);
+  assert.notEqual(replacement, url);
+  assert.equal((await requestFrom(dynamicPath(url), NETWORK_A)).status, 404);
+  assert.equal((await dynamicMovies(replacement, NETWORK_A)).length, 1);
+  await service.setPasscode(kids.id, { code: '1234' });
+  assert.deepEqual(await dynamicMovies(replacement, NETWORK_A), []);
+  assert.equal((await owner.post(`${DYNAMIC}/revoke-link`)).location, DYNAMIC);
+  assert.equal((await requestFrom(dynamicPath(replacement), NETWORK_A)).status, 404);
+  assert.deepEqual((await metas(fixed.url)).map(m => m.id), [MATRIX]);
+});
+
+test('the dynamic catalog ignores forwarded source under trust-all proxy settings', async (t) => {
+  const { owner, original, add } = await dynamicFixture(t, { trustProxy: true });
+  add(original, MATRIX, 193000);
+  await allowProfile(owner, original);
+  const ownerLink = await dynamicLink(owner);
+  assert.equal((await postFrom(owner, `${DYNAMIC}/authorize-device`, NETWORK_A, { consent: 'yes' })).status, 409);
+  assert.deepEqual(await dynamicMovies(ownerLink, NETWORK_A), []);
+});
+
+test('accounts on the same network can only authorize and read their own dynamic history', async (t) => {
+  const { base, accounts, fake, owner, original, add, pair } = await dynamicFixture(t);
+  add(original, MATRIX, 193000);
+  await allowProfile(owner, original);
+  await allowDevice(owner, NETWORK_A);
+  const ownerLink = await dynamicLink(owner);
+  const visitor = new Browser(base);
+  const firstUser = fake.user;
+  fake.user = { _id: 'other-user', email: 'other@example.com' };
+  try {
+    const login = await visitor.request('/signin', { method: 'POST', form: { email: fake.user.email, password: fake.password } });
+    assert.equal(login.location, '/configure');
+  } finally {
+    fake.user = firstUser;
+  }
+  assert.equal((await visitor.post(`${DYNAMIC}/authorize-profile`, { profileId: original.id, consent: 'yes' })).status, 404);
+  assert.equal((await visitor.post(`${DYNAMIC}/revoke-profile`, { profileId: original.id })).status, 404);
+  const visitorLink = await dynamicLink(visitor);
+  assert.deepEqual(await dynamicMovies(visitorLink, NETWORK_A), []);
+
+  const other = accounts.forAccount(2).repo.listProfiles()[0];
+  await pair(visitor, other, 'Outro lar');
+  await bind(visitor, NETWORK_A);
+  add(other, kidsOnlyMovie, 43000);
+  await allowProfile(visitor, other);
+  await allowDevice(visitor, NETWORK_A);
+  assert.deepEqual((await dynamicMovies(ownerLink, NETWORK_A)).map(m => m.id), [MATRIX]);
+  assert.deepEqual((await dynamicMovies(visitorLink, NETWORK_A)).map(m => m.id), [kidsOnlyMovie]);
+});
+
+test('a profile change while artwork is loading discards the previous catalog response', { timeout: 10_000 }, async (t) => {
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const { owner, original, kids, add } = await dynamicFixture(t, {
+    async onMetadata() {
+      started.resolve();
+      await release.promise;
+    },
+  });
+  add(original, MATRIX, 193000);
+  await allowProfile(owner, original);
+  await allowProfile(owner, kids);
+  await allowDevice(owner, NETWORK_A);
+  const url = await dynamicLink(owner);
+  const oldRequest = dynamicMovies(url, NETWORK_A);
+  try {
+    await Promise.race([started.promise, oldRequest.then(() => { throw new Error('Catalog returned before fetching metadata'); })]);
+    assert.equal((await owner.post('/devices/select-profile', { profileId: kids.id })).location, '/configure');
+  } finally {
+    release.resolve();
+  }
+  assert.deepEqual(await oldRequest, []);
 });
