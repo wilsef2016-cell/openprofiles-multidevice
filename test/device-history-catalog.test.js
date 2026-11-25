@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -25,7 +26,7 @@ const kidsOnlyMovie = 'tt0110357';
 const imdbPoster = id => `https://images.metahub.space/poster/small/${id}/img`;
 const catalogPath = (url, type = 'movie') => `${url}/catalog/${type}/history-${type === 'movie' ? 'movies' : 'series'}.json`;
 
-async function fixture(t, { trustProxy = false, onMetadata } = {}) {
+async function fixture(t, { trustProxy = false, catalogRailwayEdgeOnly = false, onMetadata } = {}) {
   const previous = process.env.MULTIDEVICE_MODE;
   process.env.MULTIDEVICE_MODE = 'true';
   t.after(() => {
@@ -56,7 +57,7 @@ async function fixture(t, { trustProxy = false, onMetadata } = {}) {
       return cover;
     },
   };
-  const config = { publicUrl: 'https://profiles.example.com', trustProxy };
+  const config = { publicUrl: 'https://profiles.example.com', trustProxy, catalogRailwayEdgeOnly };
   const app = createApp({ config, db, accounts, settings, log: silentLogger, historyCatalogUpstream });
   const server = app.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -276,17 +277,36 @@ const NETWORK_A = '1.1.1.1';
 const NETWORK_B = '8.8.8.8';
 const PROXY = '9.9.9.9';
 
-function requestFrom(url, ip, extraHeaders = {}) {
-  return fetch(url, { headers: { ...(ip && { 'x-forwarded-for': ip }), ...extraHeaders } });
+function networkRequest(url, options) {
+  if (!options.headers.host) return fetch(url, options);
+  // Exercise the Host seen by Express when a proxy sends the public hostname.
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(url, options, async res => {
+      try {
+        const chunks = [];
+        for await (const chunk of res) chunks.push(chunk);
+        resolve(new Response(Buffer.concat(chunks), { status: res.statusCode, headers: res.headers }));
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on('error', reject);
+    req.end(options.body?.toString());
+  });
 }
 
-async function postFrom(browser, path, ip, fields) {
-  const response = await fetch(browser.base + path, {
+function requestFrom(url, ip, extraHeaders = {}) {
+  return networkRequest(url, { headers: { ...(ip && { 'x-forwarded-for': ip }), ...extraHeaders } });
+}
+
+async function postFrom(browser, path, ip, fields, extraHeaders = {}) {
+  const response = await networkRequest(browser.base + path, {
     method: 'POST', redirect: 'manual',
-    headers: { cookie: browser.cookie, 'x-forwarded-for': ip, 'content-type': 'application/x-www-form-urlencoded' },
+    headers: { cookie: browser.cookie, ...(ip && { 'x-forwarded-for': ip }),
+      'content-type': 'application/x-www-form-urlencoded', ...extraHeaders },
     body: new URLSearchParams({ _csrf: await browser.csrf(), ...fields }),
   });
-  return { status: response.status, location: response.headers.get('location'), text: await response.text() };
+  return { status: response.status, location: response.headers.get('location'), headers: response.headers, text: await response.text() };
 }
 
 async function bind(browser, ip) {
@@ -558,7 +578,7 @@ test('the unified manifest keeps fixed consent separate and resolves two paired 
   const url = await dynamicLink(owner, UNIFIED);
   const initial = await manifestAt(url);
   assert.equal(initial.name, 'OpenProfiles MultiDevice');
-  assert.equal(initial.version, '0.9.0');
+  assert.equal(initial.version, '0.9.1');
   assert.deepEqual(initial.resources, ['catalog']);
   assert.deepEqual(initial.catalogs.map(c => c.name), ['Meu perfil — Filmes', 'Meu perfil — Séries']);
 
@@ -790,4 +810,114 @@ test('revoking a fixed grant during metadata loading discards the pending respon
     release.resolve();
   }
   assert.deepEqual(await pending, []);
+});
+
+function railwayHeaders(ip) {
+  return { host: 'profiles.example.com', 'x-forwarded-host': 'profiles.example.com',
+    'x-forwarded-proto': 'https', 'x-railway-edge': 'test-edge', 'x-real-ip': ip };
+}
+
+test('unified binding and catalog use the same isolated Railway ingress for two paired devices', async (t) => {
+  const { base, db, owner, pair, original, kids, add } = await fixture(t, { catalogRailwayEdgeOnly: true });
+  const other = new Browser(base);
+  assert.equal((await other.signIn()).status, 303);
+  await pair(owner, original, 'Sala');
+  await pair(other, kids, 'Quarto');
+  add(original, MATRIX, 193000);
+  add(kids, kidsOnlyMovie, 85000);
+  const ipv6 = '2606:4700:4700::1111';
+  const consent = { consent: 'yes' };
+  for (const [browser, profile, ip] of [[owner, original, ipv6], [other, kids, NETWORK_B]]) {
+    await allowProfile(browser, profile, UNIFIED);
+    assert.equal((await postFrom(browser, UNIFIED + '/bind-device', undefined, consent, railwayHeaders(ip))).location, UNIFIED);
+    assert.equal((await postFrom(browser, UNIFIED + '/authorize-device', undefined, consent, railwayHeaders(ip))).location, UNIFIED);
+  }
+  const stored = db.prepare('SELECT * FROM mp_bridge_bindings ORDER BY device_id').all();
+  assert.equal((await postFrom(owner, UNIFIED + '/bind-device', undefined, consent, railwayHeaders(ipv6))).status, 303);
+  assert.deepEqual(db.prepare('SELECT * FROM mp_bridge_bindings ORDER BY device_id').all(), stored);
+  const url = await dynamicLink(owner, UNIFIED);
+  const path = dynamicPath(url);
+  assert.deepEqual((await catalogItems(path, undefined, railwayHeaders(ipv6))).map(m => m.id), [MATRIX]);
+  assert.deepEqual((await catalogItems(path, undefined, railwayHeaders(NETWORK_B))).map(m => m.id), [kidsOnlyMovie]);
+  assert.deepEqual(await catalogItems(path, NETWORK_B), []);
+  assert.deepEqual(await catalogItems(path, undefined, railwayHeaders('10.2.3.4')), []);
+  assert.deepEqual(await catalogItems(path, undefined, railwayHeaders(PROXY)), []);
+
+  assert.equal((await postFrom(other, UNIFIED + '/bind-device', undefined, consent, railwayHeaders(ipv6))).location, UNIFIED);
+  assert.deepEqual(await catalogItems(path, undefined, railwayHeaders(ipv6)), [], 'two active bindings make the network ambiguous');
+  assert.equal((await postFrom(other, UNIFIED + '/authorize-device', undefined, consent, railwayHeaders(ipv6))).status, 409);
+});
+
+test('authenticated network diagnosis separates pairing, profile and IP without including private values', async (t) => {
+  const { base, db, owner, pair, original, kids, service, add } = await fixture(t, { trustProxy: 'loopback, uniquelocal' });
+  const diagnosis = UNIFIED + '/network-diagnostic';
+  const anonymous = new Browser(base);
+  assert.equal((await anonymous.request(diagnosis)).location, '/signin');
+  assert.equal((await anonymous.request(UNIFIED + '/bind-device', { method: 'POST' })).location, '/signin');
+  const noPair = await owner.request(diagnosis);
+  assert.equal(noPair.headers.get('cache-control'), 'no-store');
+  assert.match(noPair.text, /Navegador pareado nesta conta · Não/);
+  assert.match(noPair.text, /Perfil elegível selecionado · Não/);
+
+  await pair(owner, original, 'Sala');
+  const privateIp = '10.2.3.4';
+  const ipHeaders = railwayHeaders(NETWORK_A);
+  const failed = await postFrom(owner, UNIFIED + '/bind-device', privateIp, { consent: 'yes' }, ipHeaders);
+  assert.equal(failed.status, 409);
+  assert.equal(failed.headers.get('cache-control'), 'no-store');
+  assert.match(failed.text, /Navegador pareado nesta conta · Sim/);
+  assert.match(failed.text, /Perfil elegível selecionado · Sim/);
+  assert.match(failed.text, /IP público resolvido por uma origem confiável · Não/);
+  for (const value of [privateIp, NETWORK_A, owner.cookie, ...owner.jar.values(), await owner.csrf()]) {
+    if (value) assert.ok(!failed.text.includes(value));
+  }
+  assert.deepEqual(db.prepare('SELECT * FROM mp_bridge_bindings').all(), []);
+  const resolved = await requestFrom(base + diagnosis, NETWORK_B, { cookie: owner.cookie }).then(r => r.text());
+  assert.match(resolved, /IP público resolvido por uma origem confiável · Sim/);
+  assert.ok(!resolved.includes(NETWORK_B));
+
+  await service.setPasscode(original.id, { code: '1234' });
+  const unavailable = await requestFrom(base + diagnosis, NETWORK_B, { cookie: owner.cookie }).then(r => r.text());
+  assert.match(unavailable, /Navegador pareado nesta conta · Sim/);
+  assert.match(unavailable, /Perfil elegível selecionado · Não/);
+  assert.match(unavailable, /IP público resolvido por uma origem confiável · Sim/);
+
+  await owner.post(UNIFIED + '/authorize-fixed', { profileId: kids.id, consent: 'yes' });
+  add(kids, kidsOnlyMovie, 85000);
+  const url = await dynamicLink(owner, UNIFIED);
+  assert.deepEqual(await dynamicMovies(url), []);
+  const fixed = fixedCatalog(await manifestAt(url), kids);
+  assert.deepEqual((await catalogItems(fixedPath(url, fixed))).map(m => m.id), [kidsOnlyMovie]);
+});
+
+test('v0.7 serves both URLs advertised by the same legacy manifest without network identification', async (t) => {
+  const { db, base, owner, original, add, authorize, service } = await fixture(t);
+  const { token, url } = await authorize(owner, original);
+  const lookup = db.prepare('SELECT * FROM mp_history_catalog_grants WHERE profile_id=?');
+  const grant = lookup.get(original.id);
+  const manifestResponse = await fetch(url + '/manifest.json');
+  assert.equal(manifestResponse.status, 200);
+  const manifest = await manifestResponse.json();
+  assert.deepEqual(manifest.catalogs.map(c => c.type), ['movie', 'series']);
+  add(original, MATRIX, 193000);
+  for (const catalog of manifest.catalogs) {
+    const path = fixedPath(url, catalog);
+    for (const variant of [path, path.replace(/\.json$/, '/skip=0.json')]) {
+      const response = await requestFrom(variant);
+      assert.equal(response.status, 200);
+      assert.deepEqual((await response.json()).metas.map(m => m.id), catalog.type === 'movie' ? [MATRIX] : []);
+    }
+    assert.equal((await fetch(path.replace(catalog.id, 'old-catalog-id'))).status, 404);
+    assert.equal((await fetch(path.replace(token, 'A'.repeat(43)))).status, 404);
+  }
+  const status = await owner.request(PAGE);
+  assert.match(status.text, /Original · link ativo/);
+  assert.ok(!status.text.includes(token));
+  assert.deepEqual(lookup.get(original.id), grant);
+  assert.equal((await new Browser(base).request(PAGE)).location, '/signin');
+
+  await service.setPasscode(original.id, { code: '1234' });
+  assert.match((await owner.request(PAGE)).text, /Original · perfil indisponível/);
+  for (const catalog of manifest.catalogs) assert.equal((await fetch(fixedPath(url, catalog))).status, 404);
+  assert.deepEqual(lookup.get(original.id), grant);
 });
