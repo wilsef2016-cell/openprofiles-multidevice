@@ -5,7 +5,7 @@ import { createDeviceNetworkBridge } from './device-network-bridge.js';
 import { createDeviceNativeHistory } from './device-native-history.js';
 import { createDeviceHistoryCatalog } from './device-history-catalog.js';
 import { createHistoryCatalogContent } from './device-history-catalog-content.js';
-import { createDeviceDynamicCatalog } from './device-dynamic-catalog.js';
+import { createDeviceDynamicCatalog, createDeviceUnifiedCatalog, UNIFIED_CATALOG_PATH } from './device-dynamic-catalog.js';
 import { fileURLToPath } from 'node:url';
 import { renderDevicePlayer } from './device-player-page.js';
 import {CODE_TTL_MS,DEVICE_TTL_MS,esc,normalizedCode,pairingCode,randomSecret,sameSiteRequest,sha,validProgress} from './device-core.js';
@@ -114,7 +114,7 @@ export function createDevicePairingRouter({ db, auth, config, historyCatalogUpst
     page(res,'Aparelhos e perfis',`<p><strong>Modo experimental:</strong> cada navegador pareado recebe uma sessão própria; o Stremio nativo NÃO envia essa identidade ao addon. Perfis com PIN não são pareáveis nesta versão.</p><p>Gere um código para o aparelho e digite-o no navegador desse aparelho dentro de 5 minutos.</p>
       <form method="post" action="/devices/new-pair"><input type="hidden" name="_csrf" value="${esc(req.session.csrf)}"><label>Perfil <select name="profileId">${profiles.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label><label>Nome do aparelho <input name="label" maxlength="50" required placeholder="TV da sala"></label><button>Gerar código</button></form>
       <p><a href="/devices/tracking">Diagnóstico do Tracking Addon</a> · <a href="/devices/bridge">Associação automática por rede (experimental)</a> · <a href="/devices/native-history">Histórico experimental do Stremio</a></p>
-      <p><a href="/devices/dynamic-catalog">Configurar OpenProfiles — Meu perfil</a></p>
+      <p><a href="${UNIFIED_CATALOG_PATH}">Configurar OpenProfiles MultiDevice</a> · <a href="/devices/dynamic-catalog">Meu perfil v0.8</a></p>
       <h2>Aparelhos ativos</h2>${devices.length?`<ul>${devices.map(d=>`<li>${esc(d.label)} — ${esc(d.profile_name)} <form method="post" action="/devices/revoke"><input type="hidden" name="_csrf" value="${esc(req.session.csrf)}"><input type="hidden" name="id" value="${esc(d.id)}"><button>Revogar</button></form></li>`).join('')}</ul>`:'<p>Nenhum aparelho vinculado.</p>'}
       <p><a href="/devices/activate">Ativar neste aparelho</a></p>`);
   });
@@ -131,7 +131,7 @@ export function createDevicePairingRouter({ db, auth, config, historyCatalogUpst
     return { expiresAt: browser.expires_at };
   });
 
-  router.post('/select-profile', auth.require, auth.csrf, originOkay, (req, res) => {
+  function selectDeviceProfile(req, res, back) {
     const { error, expiresAt } = changeSelection.immediate(req);
     if (error) {
       auth.setFlash(req, { type: 'error', text: error });
@@ -139,8 +139,13 @@ export function createDevicePairingRouter({ db, auth, config, historyCatalogUpst
       setCookie(res, parseCookie(req), Math.max(0, expiresAt - Date.now()));
       auth.setFlash(req, { type: 'ok', text: 'Perfil atualizado neste aparelho.' });
     }
-    return res.redirect(303, '/configure');
-  });
+    return res.redirect(303, back);
+  }
+  router.post('/select-profile', auth.require, auth.csrf, originOkay, (req, res) => selectDeviceProfile(req, res, '/configure'));
+  router.use('/unified-catalog', createDeviceUnifiedCatalog({
+    db, auth, originOkay, page, config, currentBrowser, content, selectDeviceProfile,
+    matchCatalogNetwork: networkBridge.matchCatalogNetwork, bindCatalogNetwork: networkBridge.bindCatalogNetwork,
+  }));
 
   router.post('/new-pair',auth.require,auth.csrf,originOkay,(req,res)=> {
     const profileId=Number(req.body?.profileId);const label=String(req.body?.label||'').trim().slice(0,50);
