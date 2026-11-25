@@ -1,6 +1,7 @@
 import express from 'express';
 import crypto from 'node:crypto';
 import { esc } from './device-core.js';
+import { createCatalogIpResolver } from './device-catalog-ip.js';
 import { NETWORK_TTL_MS, networkDigest, candidateForNetwork, publicIp } from './device-bridge-core.js';
 
 /**
@@ -8,7 +9,7 @@ import { NETWORK_TTL_MS, networkDigest, candidateForNetwork, publicIp } from './
  * IP address is a weak, shared network signal, never a device identifier.
  * This bridge writes only TENTATIVE suggestions, never mp_progress/native history.
  */
-// MULTIDEVICE_REALIP_V041: read client IP from Railway's sanitized public HTTPS ingress.
+// MULTIDEVICE_REALIP_V041: legacy tentative matching uses Railway ingress hints.
 // Only a tentative network correlation; NEVER use this as authentication or device proof.
 // Direct private-network requests can forge forwarded headers, so do not use this
 // signal for access control or for overwriting verified per-profile progress.
@@ -45,6 +46,7 @@ export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, 
   db.prepare('INSERT OR IGNORE INTO mp_bridge_secret(id,value) VALUES(1,?)')
     .run(crypto.randomBytes(32).toString('hex'));
   const secret = db.prepare('SELECT value FROM mp_bridge_secret WHERE id=1').get().value;
+  const catalogIp = createCatalogIpResolver(config);
   const router = express.Router();
   const getBinding = db.prepare('SELECT * FROM mp_bridge_bindings WHERE device_id=?');
   const upsertBinding = db.prepare(`INSERT INTO mp_bridge_bindings (device_id,account_id,ip_hash,activated_at,expires_at)
@@ -82,13 +84,6 @@ export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, 
     const hash = networkDigest(secret, ip);
     const bindings = hash ? findBindings.all(accountId,hash,now) : [];
     return candidateForNetwork(bindings,hash,now);
-  }
-
-  // Catalog reads use only the connection address or Express's address-based
-  // proxy chain. The legacy X-Real-IP hint is useful for diagnostics only.
-  function catalogIp(req) {
-    const trust = config.trustProxy;
-    return trust === true || typeof trust === 'number' ? req.socket.remoteAddress : req.ip;
   }
 
   function matchCatalogNetwork(req, accountId, now = Date.now()) {
@@ -146,5 +141,5 @@ export function createDeviceNetworkBridge({db, requireDevice, originOkay, page, 
     unbind(req.mpDevice.id);
     res.redirect(303,'/devices/bridge');
   });
-  return {router,suggest,matchCatalogNetwork,bindCatalogNetwork};
+  return {router,suggest,matchCatalogNetwork,bindCatalogNetwork,hasCatalogPublicIp: req => Boolean(catalogIp(req))};
 }

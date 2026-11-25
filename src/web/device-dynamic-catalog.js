@@ -65,7 +65,7 @@ export function createDeviceUnifiedCatalog(options) {
 }
 
 function createAccountCatalog({
-  db, auth, originOkay, page, config, currentBrowser, matchCatalogNetwork, content, bindCatalogNetwork, selectDeviceProfile,
+  db, auth, originOkay, page, config, currentBrowser, matchCatalogNetwork, content, bindCatalogNetwork, hasCatalogPublicIp, selectDeviceProfile,
 }, unified) {
   const path = unified ? UNIFIED_CATALOG_PATH : DYNAMIC_PATH;
   const name = unified ? 'OpenProfiles MultiDevice' : 'OpenProfiles — Meu perfil';
@@ -170,6 +170,7 @@ function createAccountCatalog({
         <p>Um catálogo fixo autorizado pode ser visto por outros aparelhos da mesma conta Stremio, independentemente do perfil selecionado neles.</p>
         ${profileControls(req, profiles, fixed.list.all(accountId), 'fixed', 'Autorizo a exibição deste perfil em catálogos fixos para quem tem acesso ao link do add-on unificado.')}` : ''}
       <h2>Associação de rede deste aparelho</h2>
+      ${unified ? '<p><a href="/devices/unified-catalog/network-diagnostic">Diagnóstico de rede deste navegador</a></p>' : ''}
       ${unified && browser?.profile_id ? `<form method="post" action="${path}/bind-device">${csrf(req)}
         <label><input type="checkbox" name="consent" value="yes" required> Autorizo associar a rede atual ao navegador. Uma mudança de rede substitui o vínculo compartilhado com as versões anteriores.</label>
         <button type="submit">Associar rede atual</button></form>` : ''}
@@ -209,14 +210,28 @@ function createAccountCatalog({
   if (fixed) {
     manageProfiles('fixed', fixed.allow, fixed.revoke);
     router.post('/select-profile', ...manage, (req, res) => selectDeviceProfile(req, res, path));
+    function networkDiagnostic(req, res, browser, status = 200) {
+      const hasPublicIp = hasCatalogPublicIp(req);
+      return page(res, 'Diagnóstico de rede', `
+        <ul>
+          <li>Navegador pareado nesta conta · ${browser ? 'Sim' : 'Não'}</li>
+          <li>Perfil elegível selecionado · ${browser?.profile_id ? 'Sim' : 'Não'}</li>
+          <li>IP público resolvido por uma origem confiável · ${hasPublicIp ? 'Sim' : 'Não'}</li>
+        </ul>
+        ${hasPublicIp ? '' : '<p>O modo automático está indisponível nesta rede. Os catálogos fixos autorizados continuam disponíveis.</p>'}
+        <p><a href="${path}">Voltar ao OpenProfiles MultiDevice</a></p>`, status);
+    }
+    router.get('/network-diagnostic', auth.require, (req, res) => networkDiagnostic(req, res, currentBrowser(req)));
     const bindDevice = db.transaction(req => {
       const now = Date.now();
       const browser = currentBrowser(req, now);
-      return browser?.profile_id && bindCatalogNetwork(req, { id: browser.id, account_id: req.session.accountId }, now);
+      const bound = browser?.profile_id && bindCatalogNetwork(req, { id: browser.id, account_id: req.session.accountId }, now);
+      return { browser, bound };
     });
     router.post('/bind-device', ...manage, (req, res) => {
       if (req.body?.consent !== 'yes') return res.status(400).send('Consentimento obrigatório.');
-      if (!bindDevice.immediate(req)) return res.status(409).send('Rede pública ou navegador pareado indisponível.');
+      const { browser, bound } = bindDevice.immediate(req);
+      if (!bound) return networkDiagnostic(req, res, browser, 409);
       return res.redirect(303, path);
     });
   }
@@ -301,7 +316,7 @@ function createAccountCatalog({
     }
     return json(res, 200, {
       id: `org.openprofiles.multidevice.${unified ? 'unified' : 'dynamic'}.${install.public_id}`,
-      version: unified ? '0.9.0' : '0.8.0',
+      version: unified ? '0.9.1' : '0.8.0',
       name,
       description: unified ? 'Histórico experimental com catálogos por rede e perfis autorizados. A instalação é sincronizada pela conta Stremio.'
         : 'Catálogo experimental por rede. A instalação é sincronizada pela conta Stremio.',

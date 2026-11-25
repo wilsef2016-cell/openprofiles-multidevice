@@ -145,6 +145,7 @@ export function createDevicePairingRouter({ db, auth, config, historyCatalogUpst
   router.use('/unified-catalog', createDeviceUnifiedCatalog({
     db, auth, originOkay, page, config, currentBrowser, content, selectDeviceProfile,
     matchCatalogNetwork: networkBridge.matchCatalogNetwork, bindCatalogNetwork: networkBridge.bindCatalogNetwork,
+    hasCatalogPublicIp: networkBridge.hasCatalogPublicIp,
   }));
 
   router.post('/new-pair',auth.require,auth.csrf,originOkay,(req,res)=> {

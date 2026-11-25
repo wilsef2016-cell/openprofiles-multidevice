@@ -28,10 +28,10 @@ export function createDeviceHistoryCatalog({ db, auth, originOkay, page, config,
     WHERE account_id=? AND deleted_at IS NULL AND passcode_hash IS NULL ORDER BY id`);
   const eligibleProfile = db.prepare(`SELECT id FROM profiles
     WHERE account_id=? AND id=? AND deleted_at IS NULL AND passcode_hash IS NULL`);
-  const activeGrants = db.prepare(`SELECT g.profile_id,p.name,
+  const profileGrants = db.prepare(`SELECT g.profile_id,p.name,g.revoked_at IS NULL AS active,
       (p.deleted_at IS NULL AND p.passcode_hash IS NULL) AS available
     FROM mp_history_catalog_grants g JOIN profiles p ON p.id=g.profile_id AND p.account_id=g.account_id
-    WHERE g.account_id=? AND g.revoked_at IS NULL ORDER BY g.profile_id`);
+    WHERE g.account_id=? ORDER BY g.profile_id`);
   const readGrant = db.prepare(`SELECT g.account_id,g.profile_id,g.public_id,p.name
     FROM mp_history_catalog_grants g JOIN profiles p ON p.id=g.profile_id AND p.account_id=g.account_id
     WHERE g.token_hash=? AND g.revoked_at IS NULL AND p.deleted_at IS NULL AND p.passcode_hash IS NULL`);
@@ -49,7 +49,7 @@ export function createDeviceHistoryCatalog({ db, auth, originOkay, page, config,
   function dashboard(req, res, issued = '') {
     const accountId = req.session.accountId;
     const profiles = eligibleProfiles.all(accountId);
-    const grants = activeGrants.all(accountId);
+    const grants = profileGrants.all(accountId);
     page(res, 'Catálogo de histórico experimental', `
       <p>O Stremio sincroniza os add-ons instalados pela conta. O catálogo pode aparecer em outros aparelhos que usam essa conta.</p>
       <p>Quem tem o link pode ler o histórico experimental do perfil selecionado. Guarde-o em segredo. Revogar bloqueia novas consultas ao servidor. O Stremio pode manter itens já carregados até atualizar o catálogo.</p>
@@ -62,11 +62,12 @@ export function createDeviceHistoryCatalog({ db, auth, originOkay, page, config,
         <label><input type="checkbox" name="consent" value="yes" required> Autorizo a leitura do histórico experimental deste perfil pelo link e entendo que o catálogo pode aparecer em outros aparelhos da conta Stremio.</label>
         <button type="submit">Gerar link privado</button></form>
         <p>Gerar outro link para o mesmo perfil invalida o anterior.</p>` : '<p>Nenhum perfil elegível.</p>'}
-      <h2>Links autorizados</h2>
-      ${grants.length ? `<ul>${grants.map(g => `<li>${esc(g.name)}${g.available ? '' : ' · perfil indisponível'}
-        <form method="post" action="${PATH}/revoke">${csrf(req)}
+      <h2>Estado dos links v0.7</h2>
+      <p>Um link antigo pode retornar 404 se a chave foi substituída ou revogada, se o perfil está indisponível ou se o Stremio usa um endereço de catálogo diferente do manifesto.</p>
+      ${grants.length ? `<ul>${grants.map(g => `<li>${esc(g.name)} · ${g.active ? (g.available ? 'link ativo' : 'perfil indisponível') : 'link revogado'}
+        ${g.active ? `<form method="post" action="${PATH}/revoke">${csrf(req)}
           <input type="hidden" name="profileId" value="${g.profile_id}"><button type="submit">Revogar link</button>
-        </form></li>`).join('')}</ul>` : '<p>Nenhum link ativo.</p>'}
+        </form>` : ''}</li>`).join('')}</ul>` : '<p>Nenhum link ativo.</p>'}
       <p><a href="/devices/native-history">Voltar ao histórico experimental</a> · <a href="/devices/dynamic-catalog">Configurar Meu perfil</a> · <a href="/devices/unified-catalog">Add-on unificado</a></p>`);
   }
 
