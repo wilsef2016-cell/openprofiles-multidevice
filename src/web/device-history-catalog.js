@@ -1,41 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import express from 'express';
 import { esc, randomSecret, sha } from './device-core.js';
-import { createHistoryCatalogArtwork } from './device-history-catalog-artwork.js';
+import { catalogOffset } from './device-history-catalog-content.js';
 
 const PATH = '/devices/history-catalog';
 const CATALOGS = { movie: 'history-movies', series: 'history-series' };
-const PAGE_SIZE = 100;
-const VIDEO_ID = /^[a-zA-Z0-9:_-]{3,150}$/;
-
-function historyTitleId(type, videoId) {
-  if (typeof videoId !== 'string' || !VIDEO_ID.test(videoId)) return null;
-  if (type !== 'series') return videoId;
-  const episode = videoId.match(/^(tt\d{5,12}|tmdb:\d+):\d{1,6}:\d{1,6}$/) ??
-    videoId.match(/^(kitsu:\d+):\d{1,6}$/);
-  return episode?.[1] ?? videoId;
-}
-
 function readProfileId(value) {
   const id = typeof value === 'string' && /^[1-9]\d*$/.test(value) ? Number(value) : NaN;
   return Number.isSafeInteger(id) ? id : null;
 }
 
-function formatTime(ms) {
-  const seconds = Math.floor(ms / 1000);
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor(seconds / 60) % 60;
-  const pad = n => String(n).padStart(2, '0');
-  return hours ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}` : `${minutes}:${pad(seconds % 60)}`;
-}
-
-function progressLabel(row) {
-  const suffix = row.video_id === row.title_id ? [] : row.video_id.slice(row.title_id.length + 1).split(':').map(Number);
-  const episode = suffix.length === 2 ? `T${suffix[0]}E${suffix[1]} · ` : suffix.length ? `Ep. ${suffix[0]} · ` : '';
-  return `${episode}${formatTime(row.position_ms)} / ${formatTime(row.duration_ms)}`;
-}
-
-export function createDeviceHistoryCatalog({ db, auth, originOkay, page, config, historyCatalogUpstream }) {
+export function createDeviceHistoryCatalog({ db, auth, originOkay, page, config, content }) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS mp_history_catalog_grants (
       profile_id INTEGER PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
@@ -46,9 +21,6 @@ export function createDeviceHistoryCatalog({ db, auth, originOkay, page, config,
       revoked_at INTEGER
     );
   `);
-  db.function('openprofiles_history_title_id', { deterministic: true }, historyTitleId);
-
-  const artwork = createHistoryCatalogArtwork(historyCatalogUpstream);
   const router = express.Router();
   const addon = express.Router();
   const base = `${config.publicUrl.replace(/\/$/, '')}${PATH}/addon`;
@@ -71,27 +43,6 @@ export function createDeviceHistoryCatalog({ db, auth, originOkay, page, config,
   const revokeGrant = db.prepare(`UPDATE mp_history_catalog_grants SET revoked_at=?
     WHERE account_id=? AND profile_id=? AND revoked_at IS NULL`);
 
-  // Rank the best position within each video, then represent a series by its most recently recorded episode.
-  const history = db.prepare(`
-    WITH videos AS (
-      SELECT video_id,duration_ms,MIN(current_ms,duration_ms) AS position_ms,
-        openprofiles_history_title_id(type,video_id) AS title_id,
-        MAX(source_event_id) OVER (PARTITION BY video_id) AS activity,
-        ROW_NUMBER() OVER (
-          PARTITION BY video_id ORDER BY MIN(current_ms,duration_ms) DESC,source_event_id DESC
-        ) AS best
-      FROM mp_native_history_events
-      WHERE account_id=? AND profile_id=? AND type=? AND undone_at IS NULL
-    ), titles AS (
-      SELECT *, ROW_NUMBER() OVER (PARTITION BY title_id ORDER BY activity DESC) AS latest
-      FROM videos WHERE best=1 AND title_id IS NOT NULL
-    )
-    SELECT title_id,video_id,duration_ms,position_ms FROM titles WHERE latest=1
-    ORDER BY activity DESC LIMIT ? OFFSET ?
-  `);
-  const hasTitle = db.prepare(`SELECT 1 FROM mp_native_history_events
-    WHERE account_id=? AND profile_id=? AND type=? AND undone_at IS NULL
-      AND openprofiles_history_title_id(type,video_id)=? LIMIT 1`);
   const grantFor = token => /^[A-Za-z0-9_-]{43}$/.test(token) ? readGrant.get(sha(token)) : null;
 
   const csrf = req => `<input type="hidden" name="_csrf" value="${esc(req.session.csrf)}">`;
@@ -116,7 +67,7 @@ export function createDeviceHistoryCatalog({ db, auth, originOkay, page, config,
         <form method="post" action="${PATH}/revoke">${csrf(req)}
           <input type="hidden" name="profileId" value="${g.profile_id}"><button type="submit">Revogar link</button>
         </form></li>`).join('')}</ul>` : '<p>Nenhum link ativo.</p>'}
-      <p><a href="/devices/native-history">Voltar ao histórico experimental</a></p>`);
+      <p><a href="/devices/native-history">Voltar ao histórico experimental</a> · <a href="/devices/dynamic-catalog">Configurar Meu perfil</a></p>`);
   }
 
   const authorize = db.transaction((accountId, profileId) => {
@@ -176,30 +127,11 @@ export function createDeviceHistoryCatalog({ db, auth, originOkay, page, config,
     const { token, type, catalogId, extra } = req.params;
     const grant = grantFor(token);
     if (!grant || !Object.hasOwn(CATALOGS, type) || CATALOGS[type] !== catalogId) return unavailable(res);
-    const skips = new URLSearchParams(extra).getAll('skip');
-    const rawSkip = skips[0] ?? '0';
-    const skip = Number(rawSkip);
-    if (skips.length > 1 || !/^\d+$/.test(rawSkip) || !Number.isSafeInteger(skip)) return res.status(400).json({ metas: [] });
+    const skip = catalogOffset(extra);
+    if (skip === null) return res.status(400).json({ metas: [] });
 
-    const rows = history.all(grant.account_id, grant.profile_id, type, PAGE_SIZE, skip);
-    const metas = [];
-    const deadline = Date.now() + 3000;
-    for (let i = 0; i < rows.length; i += 10) {
-      const batch = rows.slice(i, i + 10);
-      const titles = Date.now() < deadline ? await Promise.all(batch.map(row => artwork.title(type, row.title_id))) : [];
-      metas.push(...batch.map((row, index) => {
-        const title = titles[index]?.name ?? row.title_id;
-        const progress = progressLabel(row);
-        return {
-          id: row.title_id,
-          type,
-          name: `${title} · ${progress}`,
-          description: `Progresso experimental OpenProfiles · ${progress}`,
-          poster: `${base}/${token}/poster/${type}/${encodeURIComponent(row.title_id)}.jpg`,
-          posterShape: 'poster',
-        };
-      }));
-    }
+    const metas = await content.list(grant, type, skip,
+      id => `${base}/${token}/poster/${type}/${encodeURIComponent(id)}.jpg`);
     return grantFor(token) ? res.json({ metas }) : unavailable(res);
   }
   addon.get('/:token/catalog/:type/:catalogId.json', catalog);
@@ -208,10 +140,9 @@ export function createDeviceHistoryCatalog({ db, auth, originOkay, page, config,
   addon.get('/:token/poster/:type/:titleId.jpg', async (req, res) => {
     const { token, type, titleId } = req.params;
     const grant = grantFor(token);
-    if (!grant || !Object.hasOwn(CATALOGS, type) || !VIDEO_ID.test(titleId) ||
-        !hasTitle.get(grant.account_id, grant.profile_id, type, titleId)) return unavailable(res);
-    const poster = await artwork.poster(type, titleId);
-    return grantFor(token) ? res.type('jpeg').send(poster) : unavailable(res);
+    if (!grant || !Object.hasOwn(CATALOGS, type)) return unavailable(res);
+    const poster = await content.poster(grant, type, titleId);
+    return poster && grantFor(token) ? res.type('jpeg').send(poster) : unavailable(res);
   });
 
   addon.use((_req, res) => unavailable(res));
